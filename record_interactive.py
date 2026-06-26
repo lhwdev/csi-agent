@@ -17,26 +17,22 @@ from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dic
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.processor import make_default_processors
 
-# Global state variables for the recording loop
-active_loop_task = None
-recording_state = "IDLE"  # IDLE, RECORDING, PAUSED, SAVING
-current_episode_idx = 0
-total_episodes = 30
-frames_in_episode = 0
-episode_time_limit = 40.0
-keep_running = True
-
-episode_start_time = 0
-accumulated_time = 0
-reset_start_time = 0
-last_frame_time = 0
-fps_log = []
-
 def record_interactive(dataset: LeRobotDataset, robot: Robot, leader: Teleoperator, cam: cv2.VideoCapture):
-    global recording_state, current_episode_idx, total_episodes, frames_in_episode
-    global episode_time_limit, keep_running
-    global episode_start_time, accumulated_time, last_frame_time, fps_log
-    global active_loop_task
+    # Global state variables for the recording loop
+    active_loop_task = None
+    recording_state = "IDLE"  # IDLE, RECORDING, PAUSED, SAVING
+    current_episode_idx = 0
+    total_episodes = 30
+    frames_in_episode = 0
+    episode_time_limit = 40.0
+    keep_running = True
+
+    episode_start_time = 0
+    accumulated_time = 0
+    reset_start_time = 0
+    last_frame_time = 0
+    fps_log = []
+
 
     # Cancel previous background task if it is still running to avoid duplicate loops
     if active_loop_task is not None and not active_loop_task.done():
@@ -148,7 +144,7 @@ def record_interactive(dataset: LeRobotDataset, robot: Robot, leader: Teleoperat
     # 2. Status Panel
     status_card = widgets.HTML()
     def update_status_card():
-        global recording_state, current_episode_idx, frames_in_episode
+        nonlocal recording_state, current_episode_idx, frames_in_episode
         state_classes = {
             "IDLE": "status-idle",
             "RECORDING": "status-recording",
@@ -288,7 +284,7 @@ def record_interactive(dataset: LeRobotDataset, robot: Robot, leader: Teleoperat
 
     def on_init_clicked(b):
         nonlocal dataset
-        global current_episode_idx, total_episodes, episode_time_limit, reset_time_limit, recording_state
+        nonlocal current_episode_idx, total_episodes, episode_time_limit, recording_state
         
         # Freeze config UI
         dataset_id_input.disabled = True
@@ -399,7 +395,7 @@ def record_interactive(dataset: LeRobotDataset, robot: Robot, leader: Teleoperat
     init_btn.on_click(on_init_clicked)
 
     def on_start_clicked(b):
-        global recording_state, episode_start_time, accumulated_time, frames_in_episode
+        nonlocal recording_state, episode_start_time, accumulated_time, frames_in_episode
         if recording_state == "IDLE":
             recording_state = "RECORDING"
             episode_start_time = time.perf_counter()
@@ -418,7 +414,7 @@ def record_interactive(dataset: LeRobotDataset, robot: Robot, leader: Teleoperat
     start_btn.on_click(on_start_clicked)
 
     def on_pause_clicked(b):
-        global recording_state, accumulated_time, episode_start_time
+        nonlocal recording_state, accumulated_time, episode_start_time
         if recording_state == "RECORDING":
             recording_state = "PAUSED"
             accumulated_time += time.perf_counter() - episode_start_time
@@ -437,7 +433,7 @@ def record_interactive(dataset: LeRobotDataset, robot: Robot, leader: Teleoperat
 
     def save_current_episode():
         nonlocal dataset
-        global recording_state, current_episode_idx, frames_in_episode
+        nonlocal recording_state, current_episode_idx, frames_in_episode
         recording_state = "SAVING"
         update_status_card()
         
@@ -483,7 +479,7 @@ def record_interactive(dataset: LeRobotDataset, robot: Robot, leader: Teleoperat
 
     def on_discard_clicked(b):
         nonlocal dataset
-        global recording_state
+        nonlocal recording_state
         recording_state = "SAVING"
         update_status_card()
         
@@ -511,7 +507,7 @@ def record_interactive(dataset: LeRobotDataset, robot: Robot, leader: Teleoperat
 
     def finalize_dataset():
         nonlocal dataset
-        global recording_state
+        nonlocal recording_state
         recording_state = "SAVING"
         update_status_card()
         add_log("Finalizing dataset on disk...")
@@ -532,7 +528,7 @@ def record_interactive(dataset: LeRobotDataset, robot: Robot, leader: Teleoperat
         update_status_card()
 
     def on_quit_clicked(b):
-        global keep_running
+        nonlocal keep_running
         add_log("Exiting Studio session...")
         keep_running = False
 
@@ -547,9 +543,9 @@ def record_interactive(dataset: LeRobotDataset, robot: Robot, leader: Teleoperat
     # ----------------- MAIN STUDIO LOOP (ASYNC) -----------------
 
     async def main_loop():
-        global keep_running, recording_state, current_episode_idx, total_episodes
-        global frames_in_episode, episode_time_limit
-        global episode_start_time, accumulated_time, last_frame_time, fps_log
+        nonlocal keep_running, recording_state, current_episode_idx, total_episodes
+        nonlocal frames_in_episode, episode_time_limit
+        nonlocal episode_start_time, accumulated_time, last_frame_time, fps_log
 
         # Reset loop parameters
         keep_running = True
