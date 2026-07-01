@@ -8,6 +8,8 @@ from pathlib import Path
 import cv2
 import ipywidgets as widgets
 from IPython.display import display
+import datasets
+datasets.disable_progress_bar()
 
 # LeRobot imports
 from lerobot.robots import Robot
@@ -17,14 +19,80 @@ from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dic
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.processor import make_default_processors
 
-def record_interactive(dataset: LeRobotDataset, robot: Robot, leader: Teleoperator, cam: cv2.VideoCapture):
+def record_interactive(robot: Robot, leader: Teleoperator, cam: cv2.VideoCapture, params=None):
+    """
+    Interactive recording studio GUI.
+    
+    Args:
+        robot: The follower robot.
+        leader: The leader teleoperator robot.
+        cam: OpenCV camera capture object.
+        params: An optional object (e.g. types.SimpleNamespace) holding configuration parameter attributes.
+        
+    Example:
+        from types import SimpleNamespace
+        
+        params = SimpleNamespace(
+            repo_id="lhwdev/pick_umbrella",
+            root_dir="/home/lhwdev/csi-agent/lerobot/lhwdev/records/pick_umbrella",
+            task="Pick up the umbrella.",
+            episodes=30,
+            episode_time=40.0,
+            resume=False
+        )
+        record_interactive(robot, leader, cam, params)
+    """
+    dataset = None
+
+    # Extract values from params if provided
+    repo_id_val = getattr(params, "repo_id", "lhwdev/pick_umbrella") if params is not None else "lhwdev/pick_umbrella"
+    
+    # Try multiple common attribute names for output path / root
+    root_dir_val = "/home/lhwdev/csi-agent/lerobot/lhwdev/records/pick_umbrella"
+    if params is not None:
+        if hasattr(params, "root_dir"):
+            root_dir_val = params.root_dir
+        elif hasattr(params, "root"):
+            root_dir_val = params.root
+        elif hasattr(params, "output_path"):
+            root_dir_val = params.output_path
+            
+    task_val = "Pick up the umbrella."
+    if params is not None:
+        if hasattr(params, "task"):
+            task_val = params.task
+        elif hasattr(params, "task_prompt"):
+            task_val = params.task_prompt
+        elif hasattr(params, "single_task"):
+            task_val = params.single_task
+            
+    episodes_val = 30
+    if params is not None:
+        if hasattr(params, "episodes"):
+            episodes_val = params.episodes
+        elif hasattr(params, "total_episodes"):
+            episodes_val = params.total_episodes
+        elif hasattr(params, "num_episodes"):
+            episodes_val = params.num_episodes
+            
+    episode_time_val = 40.0
+    if params is not None:
+        if hasattr(params, "episode_time"):
+            episode_time_val = params.episode_time
+        elif hasattr(params, "episode_time_limit"):
+            episode_time_val = params.episode_time_limit
+        elif hasattr(params, "episode_time_s"):
+            episode_time_val = params.episode_time_s
+            
+    resume_val = getattr(params, "resume", False) if params is not None else False
+
     # Global state variables for the recording loop
     active_loop_task = None
     recording_state = "IDLE"  # IDLE, RECORDING, PAUSED, SAVING
     current_episode_idx = 0
-    total_episodes = 30
+    total_episodes = episodes_val
     frames_in_episode = 0
-    episode_time_limit = 40.0
+    episode_time_limit = episode_time_val
     keep_running = True
 
     episode_start_time = 0
@@ -109,7 +177,7 @@ def record_interactive(dataset: LeRobotDataset, robot: Robot, leader: Teleoperat
         background: #f8f9fa;
         border: 1px solid #e9ecef;
         border-radius: 10px;
-        padding: 10px;
+        padding: 0px;
         font-family: monospace;
         font-size: 11px;
         line-height: 1.4;
@@ -119,7 +187,7 @@ def record_interactive(dataset: LeRobotDataset, robot: Robot, leader: Teleoperat
         color: #00ff00;
         font-family: 'Consolas', monospace;
         font-size: 11px;
-        padding: 10px;
+        padding: 0px;
         border-radius: 8px;
         height: 150px;
         overflow-y: scroll;
@@ -129,6 +197,10 @@ def record_interactive(dataset: LeRobotDataset, robot: Robot, leader: Teleoperat
         0% { box-shadow: 0 0 0 0 rgba(255, 0, 0, 0.4); }
         70% { box-shadow: 0 0 0 15px rgba(255, 0, 0, 0); }
         100% { box-shadow: 0 0 0 0 rgba(255, 0, 0, 0); }
+    }
+    @keyframes loading-bar-shift {
+        0% { left: 0%; width: 30%; }
+        100% { left: 70%; width: 30%; }
     }
     </style>
     """)
@@ -155,18 +227,27 @@ def record_interactive(dataset: LeRobotDataset, robot: Robot, leader: Teleoperat
         
         if recording_state == "RECORDING":
             sub = f"Capturing ({frames_in_episode} frames)"
+            progress_html = ""
         elif recording_state == "PAUSED":
             sub = "Paused"
+            progress_html = ""
         elif recording_state == "SAVING":
             sub = "Writing episode to disk..."
+            progress_html = """
+            <div style="margin-top: 10px; height: 6px; background-color: rgba(255,255,255,0.2); border-radius: 3px; overflow: hidden; position: relative;">
+                <div style="position: absolute; left: 0; top: 0; bottom: 0; width: 30%; background-color: white; border-radius: 3px; animation: loading-bar-shift 1s ease-in-out infinite alternate;"></div>
+            </div>
+            """
         else:
             sub = "Ready to record"
+            progress_html = ""
             
         status_card.value = f"""
         <div class="status-card {state_class}">
             <div class="status-text">{recording_state}</div>
             <div style="font-size: 14px; font-weight: 700; margin-top: 5px; opacity: 0.95;">Episode: {current_episode_idx}</div>
             <div style="font-size: 12px; margin-top: 3px; opacity: 0.8;">{sub}</div>
+            {progress_html}
         </div>
         """
 
@@ -210,12 +291,25 @@ def record_interactive(dataset: LeRobotDataset, robot: Robot, leader: Teleoperat
     add_log("Studio initialized. Connect devices and configure dataset below.")
 
     # 5. Configuration Fields (grouped in Accordion)
-    dataset_id_input = widgets.Text(value="lhwdev/pick_umbrella", description="Repo ID:")
-    root_input = widgets.Text(value="/home/lhwdev/csi-agent/lerobot/lhwdev/records/pick_umbrella", description="Root Dir:")
-    task_input = widgets.Text(value="Pick up the umbrella.", description="Task Prompt:")
-    episodes_input = widgets.IntSlider(value=30, min=1, max=100, description="Episodes:")
-    episode_time_input = widgets.FloatSlider(value=40.0, min=5.0, max=120.0, step=1.0, description="Ep Time (s):")
-    resume_checkbox = widgets.Checkbox(value=False, description="Resume existing dataset")
+    dataset_id_input = widgets.Text(value=repo_id_val, description="Repo ID:")
+    root_input = widgets.Text(value=root_dir_val, description="Root Dir:")
+    task_input = widgets.Text(value=task_val, description="Task Prompt:")
+    
+    # Safely construct sliders to avoid out-of-range value errors in ipywidgets
+    episodes_input = widgets.IntSlider(
+        value=episodes_val,
+        min=min(1, episodes_val),
+        max=max(100, episodes_val),
+        description="Episodes:"
+    )
+    episode_time_input = widgets.FloatSlider(
+        value=episode_time_val,
+        min=min(5.0, episode_time_val),
+        max=max(120.0, episode_time_val),
+        step=1.0,
+        description="Ep Time (s):"
+    )
+    resume_checkbox = widgets.Checkbox(value=resume_val, description="Resume existing dataset")
     init_btn = widgets.Button(description="Initialize Dataset", button_style="info", icon="database")
 
     config_box = widgets.VBox([
@@ -263,6 +357,16 @@ def record_interactive(dataset: LeRobotDataset, robot: Robot, leader: Teleoperat
         status_card
     ], layout=widgets.Layout(width="55%", padding="10px"))
 
+    telemetry_accordion = widgets.Accordion(children=[telemetry_widget])
+    telemetry_accordion.set_title(0, "Telemetry")
+    telemetry_accordion.selected_index = 0
+    telemetry_accordion.layout = widgets.Layout(margin="2px 0px")
+
+    log_accordion = widgets.Accordion(children=[log_widget])
+    log_accordion.set_title(0, "Studio Log")
+    log_accordion.selected_index = 0
+    log_accordion.layout = widgets.Layout(margin="2px 0px")
+
     right_column = widgets.VBox([
         header_widget,
         config_accordion,
@@ -270,10 +374,10 @@ def record_interactive(dataset: LeRobotDataset, robot: Robot, leader: Teleoperat
         control_row_1,
         control_row_2,
         navigation_row,
-        widgets.HTML("<br/><b>Telemetry:</b>"),
-        telemetry_widget,
-        widgets.HTML("<br/><b>Studio Log:</b>"),
-        log_widget
+        widgets.HTML("<br/>"),
+        telemetry_accordion,
+        widgets.HTML("<br/>"),
+        log_accordion
     ], layout=widgets.Layout(width="45%", padding="10px"))
 
     dashboard_layout = widgets.HBox([left_column, right_column], layout=widgets.Layout(
@@ -432,7 +536,7 @@ def record_interactive(dataset: LeRobotDataset, robot: Robot, leader: Teleoperat
     pause_btn.on_click(on_pause_clicked)
 
     def save_current_episode():
-        nonlocal dataset
+        nonlocal dataset, keep_running
         nonlocal recording_state, current_episode_idx, frames_in_episode
         recording_state = "SAVING"
         update_status_card()
@@ -455,6 +559,7 @@ def record_interactive(dataset: LeRobotDataset, robot: Robot, leader: Teleoperat
             if current_episode_idx >= total_episodes:
                 add_log("All target episodes recorded! Finalizing dataset...")
                 finalize_dataset()
+                keep_running = False
             else:
                 # Automatically move to next episode
                 recording_state = "IDLE"
@@ -531,6 +636,13 @@ def record_interactive(dataset: LeRobotDataset, robot: Robot, leader: Teleoperat
         nonlocal keep_running
         add_log("Exiting Studio session...")
         keep_running = False
+        try:
+            from IPython import get_ipython
+            ip = get_ipython()
+            if ip is not None:
+                ip.events.unregister('pre_run_cell', stop_studio_on_new_cell)
+        except Exception as e:
+            pass
 
     quit_btn.on_click(on_quit_clicked)
 
@@ -641,4 +753,36 @@ def record_interactive(dataset: LeRobotDataset, robot: Robot, leader: Teleoperat
                 finalize_dataset()
             add_log("Studio cleanup completed.")
 
-    active_loop_task = asyncio.create_task(main_loop())
+    def stop_studio_on_new_cell(*args, **kwargs):
+        nonlocal keep_running
+        if keep_running:
+            add_log("New cell execution started. Automatically stopping studio...")
+            keep_running = False
+            try:
+                from IPython import get_ipython
+                ip = get_ipython()
+                if ip is not None:
+                    ip.events.unregister('pre_run_cell', stop_studio_on_new_cell)
+            except Exception as e:
+                pass
+
+    try:
+        from IPython import get_ipython
+        ip = get_ipython()
+        if ip is not None:
+            ip.events.register('pre_run_cell', stop_studio_on_new_cell)
+    except Exception as e:
+        pass
+
+    if params is not None:
+        on_init_clicked(None)
+
+    # Start the task asynchronously in the background so the cell completes immediately.
+    # This allows Jupyter/VS Code to render and update widget views in real-time.
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+
+    loop.create_task(main_loop())
+    add_log("Studio started in background. Cell execution finished. You can now use widgets in real-time.")

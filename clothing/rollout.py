@@ -19,19 +19,10 @@ def rollout(
     task: str,
     fps: float,
     asynchronous: bool = True,
-    width: int | None = None,
-    height: int | None = None,
+    compile: bool = True,
 ):
     init_logging()
     register_third_party_plugins()
-
-    # Adjust camera resolutions if specified
-    if hasattr(robot, "cameras") and robot.cameras:
-        for name, camera_cfg in robot.cameras.items():
-            if width is not None:
-                camera_cfg.width = width
-            if height is not None:
-                camera_cfg.height = height
     
     # IMPROVEMENT: Enable temporal ensembling for ACT policy to prevent shaking
     if policy.type == "act":
@@ -49,8 +40,10 @@ def rollout(
         inference=inference_config,
         fps=fps,
         task=task,
-        # use_torch_compile=True,  # Optimizes model execution latency 
+        use_torch_compile=compile,  # Optimizes model execution latency 
         device="xpu",
+
+        interpolation_multiplier=2,
     )
     
     signal_handler = ProcessSignalHandler(use_threads=True, display_pid=False)
