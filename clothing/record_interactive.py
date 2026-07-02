@@ -101,6 +101,13 @@ def record_interactive(robot: Robot, leader: Teleoperator, params=None):
     fps_log = []
 
 
+    # Stop background camera capture and start the streaming server
+    from camera_streamer import CameraStreamer
+    streamer = CameraStreamer()
+    streamer.stop_all_captures()
+    streamer_port = streamer.start_server()
+    print(f"Camera Stream URL: {streamer.get_server_url()}")
+
     # Cancel previous background task if it is still running to avoid duplicate loops
     if active_loop_task is not None and not active_loop_task.done():
         active_loop_task.cancel()
@@ -417,6 +424,13 @@ def record_interactive(robot: Robot, leader: Teleoperator, params=None):
 
     # ----------------- CALLBACK IMPLEMENTATION -----------------
 
+    def schedule_background_task(coro):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
+        return loop.create_task(coro)
+
     def on_init_clicked(b):
         nonlocal dataset
         nonlocal current_episode_idx, total_episodes, episode_time_limit, recording_state
@@ -497,7 +511,7 @@ def record_interactive(robot: Robot, leader: Teleoperator, params=None):
             
             # Enable studio controls
             start_btn.disabled = False
-            prev_btn.disabled = (current_episode_idx == 0)
+            update_navigation_buttons()
             
             recording_state = "IDLE"
             update_status_card()
@@ -517,22 +531,158 @@ def record_interactive(robot: Robot, leader: Teleoperator, params=None):
 
     init_btn.on_click(on_init_clicked)
 
+    def update_navigation_buttons():
+        nonlocal current_episode_idx, dataset
+        if dataset is not None and recording_state == "IDLE":
+            prev_btn.disabled = (current_episode_idx == 0)
+            next_btn.disabled = (current_episode_idx >= dataset.num_episodes)
+        else:
+            prev_btn.disabled = True
+            next_btn.disabled = True
+
+    def on_prev_clicked(b):
+        nonlocal current_episode_idx, dataset
+        if dataset is not None and recording_state == "IDLE":
+            current_episode_idx = max(0, current_episode_idx - 1)
+            episode_progress.value = current_episode_idx
+            update_navigation_buttons()
+            add_log(f"Selected Episode {current_episode_idx} for viewing/recording.")
+
+    prev_btn.on_click(on_prev_clicked)
+
+    def on_next_clicked(b):
+        nonlocal current_episode_idx, dataset
+        if dataset is not None and recording_state == "IDLE":
+            current_episode_idx = min(dataset.num_episodes, current_episode_idx + 1)
+            episode_progress.value = current_episode_idx
+            update_navigation_buttons()
+            add_log(f"Selected Episode {current_episode_idx} for viewing/recording.")
+
+    next_btn.on_click(on_next_clicked)
+
+    async def truncate_dataset_async(target_num_episodes):
+        nonlocal dataset, recording_state, current_episode_idx
+        # Disable all UI controls
+        start_btn.disabled = True
+        prev_btn.disabled = True
+        next_btn.disabled = True
+        recording_state = "SAVING"
+        update_status_card()
+        
+        repo_id = dataset_id_input.value
+        root_dir = Path(root_input.value)
+        
+        try:
+            if target_num_episodes == 0:
+                add_log("Deleting all episodes and recreating dataset...")
+                # Close the writer
+                if dataset is not None:
+                    await asyncio.to_thread(dataset.finalize)
+                
+                # Delete files safely
+                import shutil
+                if root_dir.exists():
+                    await asyncio.to_thread(shutil.rmtree, root_dir)
+                
+                # Re-create features
+                dataset_features = combine_feature_dicts(
+                    aggregate_pipeline_dataset_features(
+                        pipeline=teleop_action_processor,
+                        initial_features=create_initial_features(action=robot.action_features),
+                        use_videos=True,
+                    ),
+                    aggregate_pipeline_dataset_features(
+                        pipeline=robot_observation_processor,
+                        initial_features=create_initial_features(observation=robot.observation_features),
+                        use_videos=True,
+                    ),
+                )
+                
+                dataset = await asyncio.to_thread(
+                    LeRobotDataset.create,
+                    repo_id=repo_id,
+                    fps=30,
+                    root=str(root_dir),
+                    robot_type=robot.name,
+                    features=dataset_features,
+                    use_videos=True,
+                    streaming_encoding=True
+                )
+                add_log("Dataset reset to 0 episodes.")
+            else:
+                add_log(f"Truncating dataset to keep {target_num_episodes} episodes...")
+                # Close writer
+                await asyncio.to_thread(dataset.finalize)
+                
+                # We need to delete episodes from target_num_episodes to dataset.num_episodes - 1
+                episode_indices_to_delete = list(range(target_num_episodes, dataset.num_episodes))
+                
+                # Create a temp directory for the edited dataset
+                import tempfile
+                import shutil
+                temp_dir = Path(tempfile.mkdtemp(dir=str(root_dir.parent)))
+                
+                # Run delete_episodes in a background thread
+                from lerobot.datasets import delete_episodes
+                new_dataset = await asyncio.to_thread(
+                    delete_episodes,
+                    dataset=dataset,
+                    episode_indices=episode_indices_to_delete,
+                    output_dir=temp_dir,
+                    repo_id=repo_id
+                )
+                
+                # Delete the old root and move temp_dir to root
+                if root_dir.exists():
+                    await asyncio.to_thread(shutil.rmtree, root_dir)
+                await asyncio.to_thread(shutil.move, str(temp_dir), str(root_dir))
+                
+                # Resume the dataset from the updated root directory
+                dataset = await asyncio.to_thread(
+                    LeRobotDataset.resume,
+                    repo_id=repo_id,
+                    root=str(root_dir),
+                    streaming_encoding=True
+                )
+                add_log(f"Dataset successfully truncated to {dataset.num_episodes} episodes.")
+        except Exception as e:
+            add_log(f"Error during truncation: {str(e)}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            current_episode_idx = dataset.num_episodes
+            episode_progress.value = current_episode_idx
+
+    async def start_recording_async():
+        nonlocal recording_state, episode_start_time, accumulated_time, frames_in_episode, current_episode_idx, dataset
+        if recording_state != "IDLE":
+            return
+        
+        # If we selected a previous episode, truncate the dataset first
+        if current_episode_idx < dataset.num_episodes:
+            await truncate_dataset_async(current_episode_idx)
+            if current_episode_idx != dataset.num_episodes:
+                add_log("Aborting recording start because truncation failed.")
+                return
+            
+        recording_state = "RECORDING"
+        episode_start_time = time.perf_counter()
+        accumulated_time = 0.0
+        frames_in_episode = 0
+        
+        # Configure buttons
+        start_btn.disabled = True
+        pause_btn.disabled = False
+        stop_btn.disabled = False
+        discard_btn.disabled = False
+        prev_btn.disabled = True
+        next_btn.disabled = True
+        
+        add_log(f"Recording episode {current_episode_idx}...")
+        update_status_card()
+
     def on_start_clicked(b):
-        nonlocal recording_state, episode_start_time, accumulated_time, frames_in_episode
-        if recording_state == "IDLE":
-            recording_state = "RECORDING"
-            episode_start_time = time.perf_counter()
-            accumulated_time = 0.0
-            frames_in_episode = 0
-            
-            # Configure buttons
-            start_btn.disabled = True
-            pause_btn.disabled = False
-            stop_btn.disabled = False
-            discard_btn.disabled = False
-            
-            add_log(f"Recording episode {current_episode_idx}...")
-            update_status_card()
+        schedule_background_task(start_recording_async())
 
     start_btn.on_click(on_start_clicked)
 
@@ -554,9 +704,11 @@ def record_interactive(robot: Robot, leader: Teleoperator, params=None):
 
     pause_btn.on_click(on_pause_clicked)
 
-    def save_current_episode():
+    async def save_current_episode_async():
         nonlocal dataset, keep_running
         nonlocal recording_state, current_episode_idx, frames_in_episode
+        if recording_state == "SAVING":
+            return
         recording_state = "SAVING"
         update_status_card()
         
@@ -569,7 +721,7 @@ def record_interactive(robot: Robot, leader: Teleoperator, params=None):
         add_log(f"Saving episode {current_episode_idx}...")
         try:
             # Save episode to disk
-            dataset.save_episode()
+            await asyncio.to_thread(dataset.save_episode)
             add_log(f"Episode {current_episode_idx} saved successfully! ({frames_in_episode} frames)")
             
             current_episode_idx += 1
@@ -577,7 +729,7 @@ def record_interactive(robot: Robot, leader: Teleoperator, params=None):
             
             if current_episode_idx >= total_episodes:
                 add_log("All target episodes recorded! Finalizing dataset...")
-                finalize_dataset()
+                await finalize_dataset_async()
                 keep_running = False
             else:
                 # Automatically move to next episode
@@ -590,6 +742,7 @@ def record_interactive(robot: Robot, leader: Teleoperator, params=None):
                 stop_btn.disabled = True
                 discard_btn.disabled = True
                 time_progress.value = 0.0
+                update_navigation_buttons()
                 add_log(f"Automatically moved to Episode {current_episode_idx}. Ready to record.")
         except Exception as e:
             add_log(f"Error saving episode: {str(e)}")
@@ -598,18 +751,24 @@ def record_interactive(robot: Robot, leader: Teleoperator, params=None):
             pause_btn.disabled = False
             stop_btn.disabled = False
             discard_btn.disabled = False
+            update_navigation_buttons()
 
-    stop_btn.on_click(lambda b: save_current_episode())
+    def on_stop_clicked(b):
+        schedule_background_task(save_current_episode_async())
 
-    def on_discard_clicked(b):
+    stop_btn.on_click(on_stop_clicked)
+
+    async def on_discard_clicked_async():
         nonlocal dataset
         nonlocal recording_state
+        if recording_state == "SAVING":
+            return
         recording_state = "SAVING"
         update_status_card()
         
         add_log(f"Discarding episode {current_episode_idx} buffer...")
         try:
-            dataset.clear_episode_buffer(delete_images=True)
+            await asyncio.to_thread(dataset.clear_episode_buffer, delete_images=True)
             add_log("Episode buffer discarded.")
             
             # Reset control states
@@ -622,14 +781,19 @@ def record_interactive(robot: Robot, leader: Teleoperator, params=None):
             
             recording_state = "IDLE"
             update_status_card()
+            update_navigation_buttons()
         except Exception as e:
             add_log(f"Error discarding episode: {str(e)}")
             recording_state = "PAUSED"
             update_status_card()
+            update_navigation_buttons()
+
+    def on_discard_clicked(b):
+        schedule_background_task(on_discard_clicked_async())
 
     discard_btn.on_click(on_discard_clicked)
 
-    def finalize_dataset():
+    async def finalize_dataset_async():
         nonlocal dataset
         nonlocal recording_state
         recording_state = "SAVING"
@@ -637,7 +801,7 @@ def record_interactive(robot: Robot, leader: Teleoperator, params=None):
         add_log("Finalizing dataset on disk...")
         try:
             if dataset:
-                dataset.finalize()
+                await asyncio.to_thread(dataset.finalize)
             add_log("Dataset finalized successfully! You can now push to hub or train.")
         except Exception as e:
             add_log(f"Error during finalization: {str(e)}")
@@ -681,6 +845,7 @@ def record_interactive(robot: Robot, leader: Teleoperator, params=None):
         # Reset loop parameters
         keep_running = True
         loop_fps = 30.0
+        last_widget_update_time = 0.0
 
         add_log("Studio loop started in background.")
 
@@ -724,15 +889,29 @@ def record_interactive(robot: Robot, leader: Teleoperator, params=None):
                         # Check for automatic episode end
                         if elapsed >= episode_time_limit:
                             add_log("Episode time limit reached.")
-                            save_current_episode()
+                            schedule_background_task(save_current_episode_async())
                         
-                # 4. Update Live Camera feed widgets (convert RGB to BGR for jpeg encoding)
+                # 4. Update Live Camera feed widgets and HTTP Streamer
+                now = time.perf_counter()
+                should_update_widgets = (now - last_widget_update_time >= 0.2)  # Update widgets at 5 Hz
+                
                 for key, widget in [("left_cam", left_camera_widget), ("top", top_camera_widget), ("right_cam", right_camera_widget)]:
                     if key in obs:
-                        rgb_img = obs[key]
-                        bgr_img = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
-                        _, jpeg_encoded = cv2.imencode('.jpg', bgr_img)
-                        widget.value = jpeg_encoded.tobytes()
+                        # Only encode if someone is watching the HTTP stream, or if it is time to update the notebook widgets
+                        has_stream_client = streamer.active_clients.get(key, 0) > 0
+                        if has_stream_client or should_update_widgets:
+                            rgb_img = obs[key]
+                            bgr_img = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
+                            _, jpeg_encoded = cv2.imencode('.jpg', bgr_img)
+                            jpeg_bytes = jpeg_encoded.tobytes()
+                            
+                            if should_update_widgets:
+                                widget.value = jpeg_bytes
+                            if has_stream_client:
+                                streamer.update_frame(key, jpeg_bytes)
+                                
+                if should_update_widgets:
+                    last_widget_update_time = now
                 
                 # 6. Telemetry updates (throttled to 5Hz to avoid UI lag)
                 if frames_in_episode % 6 == 0 or recording_state != "RECORDING":
@@ -761,7 +940,7 @@ def record_interactive(robot: Robot, leader: Teleoperator, params=None):
             add_log("Studio loop stopped.")
             # Safe finalization
             if dataset is not None and not dataset._is_finalized:
-                finalize_dataset()
+                await finalize_dataset_async()
             add_log("Studio cleanup completed.")
 
     def stop_studio_on_new_cell(*args, **kwargs):

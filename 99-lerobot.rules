@@ -1,0 +1,8 @@
+SUBSYSTEM=="tty", ATTRS{serial}=="5AAF219589", SYMLINK+="lerobot/follower_1"
+SUBSYSTEM=="tty", ATTRS{serial}=="5AAF219599", SYMLINK+="lerobot/follower_2"
+SUBSYSTEM=="tty", ATTRS{serial}=="5AB9064872", SYMLINK+="lerobot/leader_1"
+SUBSYSTEM=="tty", ATTRS{serial}=="5AAF218520", SYMLINK+="lerobot/leader_2"
+
+SUBSYSTEM=="video4linux", ENV{ID_PATH}=="pci-0000:00:14.0-usb-0:3:1.0", ATTR{index}=="0", SYMLINK+="lerobot/camera_0"
+SUBSYSTEM=="video4linux", ENV{ID_PATH}=="pci-0000:00:14.0-usb-0:9:1.0", ATTR{index}=="0", SYMLINK+="lerobot/camera_1"
+SUBSYSTEM=="video4linux", ENV{ID_PATH}=="pci-0000:00:14.0-usb-0:14:1.0", ATTR{index}=="0", SYMLINK+="lerobot/camera_2"
