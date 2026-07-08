@@ -229,7 +229,12 @@ class CameraStreamHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         streamer = CameraStreamer()
-        if self.path == "/":
+        from urllib.parse import urlparse, parse_qs
+        parsed_url = urlparse(self.path)
+        path = parsed_url.path
+        query = parse_qs(parsed_url.query)
+
+        if path == "/":
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
@@ -357,34 +362,60 @@ class CameraStreamHandler(BaseHTTPRequestHandler):
     <div class="header">
         <h1>LeRobot Camera Studio</h1>
         <p class="subtitle">Real-time MJPEG Stream representing bimanual follower configuration</p>
+        <div style="margin-top: 16px; display: flex; align-items: center; gap: 8px; justify-content: center;">
+            <label for="fps-select" style="font-size: 0.9rem; color: var(--text-muted);">Stream Framerate:</label>
+            <select id="fps-select" style="background-color: var(--card-bg); color: var(--text-color); border: 1px solid var(--border-color); border-radius: 8px; padding: 6px 12px; font-family: inherit; cursor: pointer; outline: none;">
+                <option value="5">5 FPS (Low Bandwidth)</option>
+                <option value="10">10 FPS (Medium)</option>
+                <option value="15" selected>15 FPS (Default)</option>
+                <option value="30">30 FPS (High Performance)</option>
+            </select>
+        </div>
     </div>
     <div class="grid">
         <div class="camera-card">
             <div class="camera-title"><span class="status-dot"></span> Left Camera</div>
             <div class="img-container">
-                <img src="/stream/left_cam" alt="Left Camera Stream" />
+                <img id="left_cam_img" src="/stream/left_cam" alt="Left Camera Stream" />
             </div>
         </div>
         <div class="camera-card">
             <div class="camera-title"><span class="status-dot"></span> Top Camera</div>
             <div class="img-container">
-                <img src="/stream/top" alt="Top Camera Stream" />
+                <img id="top_img" src="/stream/top" alt="Top Camera Stream" />
             </div>
         </div>
         <div class="camera-card">
             <div class="camera-title"><span class="status-dot"></span> Right Camera</div>
             <div class="img-container">
-                <img src="/stream/right_cam" alt="Right Camera Stream" />
+                <img id="right_cam_img" src="/stream/right_cam" alt="Right Camera Stream" />
             </div>
         </div>
     </div>
+    <script>
+        const select = document.getElementById('fps-select');
+        const imgLeft = document.getElementById('left_cam_img');
+        const imgTop = document.getElementById('top_img');
+        const imgRight = document.getElementById('right_cam_img');
+        
+        function updateStreams() {
+            const fps = select.value;
+            imgLeft.src = "/stream/left_cam?fps=" + fps;
+            imgTop.src = "/stream/top?fps=" + fps;
+            imgRight.src = "/stream/right_cam?fps=" + fps;
+        }
+        
+        select.addEventListener('change', updateStreams);
+        // Initial set
+        updateStreams();
+    </script>
 </body>
 </html>
 """
             self.wfile.write(html.encode("utf-8"))
             return
 
-        parts = self.path.split("/")
+        parts = path.split("/")
         if len(parts) == 3 and parts[1] == "stream":
             cam_key = parts[2]
             if cam_key not in streamer.camera_configs:
@@ -395,21 +426,39 @@ class CameraStreamHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
             self.end_headers()
 
+            # Parse query params for FPS throttling
+            fps_params = query.get("fps", [])
+            target_fps = 15.0  # Default to 15 FPS
+            if fps_params:
+                try:
+                    target_fps = float(fps_params[0])
+                except ValueError:
+                    pass
+            target_interval = 1.0 / target_fps if target_fps > 0 else 0.033
+
             streamer.client_connected(cam_key)
             try:
                 last_frame = None
+                last_sent_time = 0.0
                 while streamer.running:
+                    now = time.time()
+                    elapsed = now - last_sent_time
+                    if elapsed < target_interval:
+                        # Sleep the remaining time of the interval
+                        time.sleep(max(0.001, target_interval - elapsed))
+                        continue
+
                     frame = streamer.get_frame(cam_key)
-                    if frame is not None and frame != last_frame:
+                    if frame is not None:
                         self.wfile.write(b"--frame\r\n")
                         self.wfile.write(b"Content-Type: image/jpeg\r\n")
                         self.wfile.write(f"Content-Length: {len(frame)}\r\n\r\n".encode())
                         self.wfile.write(frame)
                         self.wfile.write(b"\r\n")
                         last_frame = frame
+                        last_sent_time = time.time()
                     else:
-                        time.sleep(0.01)  # If no new frame, wait a bit
-                    time.sleep(0.02)  # Maintain client thread rate
+                        time.sleep(0.01)
             except (ConnectionResetError, BrokenPipeError):
                 pass
             finally:

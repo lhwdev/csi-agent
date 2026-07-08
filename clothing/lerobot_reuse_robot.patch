@@ -1,0 +1,155 @@
+diff --git a/src/lerobot/cameras/opencv/camera_opencv.py b/src/lerobot/cameras/opencv/camera_opencv.py
+index b3c20e8d..e276a081 100644
+--- a/src/lerobot/cameras/opencv/camera_opencv.py
++++ b/src/lerobot/cameras/opencv/camera_opencv.py
+@@ -278,15 +278,19 @@ class OpenCVCamera(Camera):
+ 
+         actual_width = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_WIDTH)))
+         if not width_success or self.capture_width != actual_width:
+-            raise RuntimeError(
+-                f"{self} failed to set capture_width={self.capture_width} ({actual_width=}, {width_success=})."
+-            )
++            msg = f"{self} failed to set capture_width={self.capture_width} ({actual_width=}, {width_success=})."
++            if self.config.prevent_resize:
++                raise RuntimeError(msg)
++            else:
++                logger.warning(msg + " Falling back to software resizing.")
+ 
+         actual_height = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+         if not height_success or self.capture_height != actual_height:
+-            raise RuntimeError(
+-                f"{self} failed to set capture_height={self.capture_height} ({actual_height=}, {height_success=})."
+-            )
++            msg = f"{self} failed to set capture_height={self.capture_height} ({actual_height=}, {height_success=})."
++            if self.config.prevent_resize:
++                raise RuntimeError(msg)
++            else:
++                logger.warning(msg + " Falling back to software resizing.")
+ 
+     @staticmethod
+     def find_cameras() -> list[dict[str, Any]]:
+@@ -414,21 +418,27 @@ class OpenCVCamera(Camera):
+ 
+         h, w, c = image.shape
+ 
+-        if h != self.capture_height or w != self.capture_width:
+-            raise RuntimeError(
+-                f"{self} frame width={w} or height={h} do not match configured width={self.capture_width} or height={self.capture_height}."
+-            )
+-
+         if c != 3:
+             raise RuntimeError(f"{self} frame channels={c} do not match expected 3 channels (RGB/BGR).")
+ 
+         processed_image = image
++        if h != self.capture_height or w != self.capture_width:
++            if self.config.prevent_resize:
++                raise RuntimeError(
++                    f"{self} frame width={w} or height={h} do not match configured width={self.capture_width} or height={self.capture_height}."
++                )
++            processed_image = cv2.resize(image, (self.capture_width, self.capture_height))
++
+         if self.color_mode == ColorMode.RGB:
+-            processed_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
++            processed_image = cv2.cvtColor(processed_image, cv2.COLOR_BGR2RGB)
+ 
+         if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180]:
+             processed_image = cv2.rotate(processed_image, self.rotation)
+ 
++        final_h, final_w, _ = processed_image.shape
++        if final_h != self.height or final_w != self.width:
++            processed_image = cv2.resize(processed_image, (self.width, self.height))
++
+         return processed_image
+ 
+     def _read_loop(self) -> None:
+diff --git a/src/lerobot/cameras/opencv/configuration_opencv.py b/src/lerobot/cameras/opencv/configuration_opencv.py
+index 8ae57fe3..f1b704e6 100644
+--- a/src/lerobot/cameras/opencv/configuration_opencv.py
++++ b/src/lerobot/cameras/opencv/configuration_opencv.py
+@@ -64,6 +64,7 @@ class OpenCVCameraConfig(CameraConfig):
+     warmup_s: int = 1
+     fourcc: str | None = None
+     backend: Cv2Backends = Cv2Backends.ANY
++    prevent_resize: bool = False
+ 
+     def __post_init__(self) -> None:
+         self.color_mode = ColorMode(self.color_mode)
+diff --git a/src/lerobot/rollout/configs.py b/src/lerobot/rollout/configs.py
+index 60c47cfb..9638dd38 100644
+--- a/src/lerobot/rollout/configs.py
++++ b/src/lerobot/rollout/configs.py
+@@ -19,6 +19,10 @@ from __future__ import annotations
+ import abc
+ import logging
+ from dataclasses import dataclass, field
++from typing import TYPE_CHECKING
++
++if TYPE_CHECKING:
++    from lerobot.robots.robot import Robot
+ 
+ import draccus
+ 
+@@ -204,7 +208,7 @@ class RolloutConfig:
+     """
+ 
+     # Hardware
+-    robot: RobotConfig | None = None
++    robot: RobotConfig | Robot | None = None
+     teleop: TeleoperatorConfig | None = None
+ 
+     # Policy (loaded from --policy.path via __post_init__)
+diff --git a/src/lerobot/rollout/context.py b/src/lerobot/rollout/context.py
+index bf5fa0fd..19f5cb2c 100644
+--- a/src/lerobot/rollout/context.py
++++ b/src/lerobot/rollout/context.py
+@@ -214,7 +214,6 @@ def build_rollout_context(
+                 compile_kwargs = {
+                     "backend": cfg.torch_compile_backend,
+                     "mode": cfg.torch_compile_mode,
+-                    "options": {"triton.cudagraphs": False},
+                 }
+                 policy.predict_action_chunk = torch.compile(policy.predict_action_chunk, **compile_kwargs)
+                 logger.info("torch.compile applied to predict_action_chunk")
+@@ -233,10 +232,20 @@ def build_rollout_context(
+         robot_observation_processor = robot_observation_processor or _o
+ 
+     # --- 3. Hardware (heaviest side-effect, deferred) -----------------
+-    logger.info("Connecting robot (%s)...", cfg.robot.type if cfg.robot else "?")
+-    robot = make_robot_from_config(cfg.robot)
+-    robot.connect()
+-    logger.info("Robot connected: %s", robot.name)
++    from lerobot.robots.robot import Robot
++    if isinstance(cfg.robot, Robot):
++        robot = cfg.robot
++        robot._reused = True
++        logger.info("Reusing existing robot instance: %s", robot.name)
++    else:
++        logger.info("Connecting robot (%s)...", cfg.robot.type if cfg.robot else "?")
++        robot = make_robot_from_config(cfg.robot)
++
++    if not robot.is_connected:
++        robot.connect()
++        logger.info("Robot connected: %s", robot.name)
++    else:
++        logger.info("Robot %s is already connected, skipping connect.", robot.name)
+ 
+     # Store the initial joint positions so we can return to a safe pose on shutdown.
+     initial_obs = robot.get_observation()
+diff --git a/src/lerobot/rollout/strategies/core.py b/src/lerobot/rollout/strategies/core.py
+index 9c897522..64ee7b38 100644
+--- a/src/lerobot/rollout/strategies/core.py
++++ b/src/lerobot/rollout/strategies/core.py
+@@ -130,8 +130,11 @@ class RolloutStrategy(abc.ABC):
+                 logger.info(
+                     "Skipping return-to-initial-position (disabled by config); leaving robot in final pose."
+                 )
+-            logger.info("Disconnecting robot...")
+-            robot.disconnect()
++            if getattr(robot, "_reused", False):
++                logger.info("Robot is reused, skipping disconnect.")
++            else:
++                logger.info("Disconnecting robot...")
++                robot.disconnect()
+         teleop = hw.teleop
+         if teleop is not None and teleop.is_connected:
+             logger.info("Disconnecting teleoperator...")

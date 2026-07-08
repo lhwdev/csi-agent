@@ -8,9 +8,14 @@ This project aims to use so101_follower and so101_leader lobots to achieve VLA-b
 
 All commands are automatically run inside conda lerobot environment.
 
-Refer to `./AGENT_GUIDE.md` for more details about lerobot codebase.
+Refer to `../lerobot/AGENT_GUIDE.md` for more details about lerobot codebase.
 
 ## Workspaces
 
 - primary coding workspace: `./`
-- lerobot repository: `../lerobot`. Do NOT modify this, unless you are sure that lerobot codebase itself contains bug or problem. If so, confirm me.
+- lerobot repository: `../lerobot`. Do NOT modify this, unless you are sure that lerobot codebase
+  itself contains bug or problem.
+
+## Tooling
+
+- `*.ipynb` Jupyteer Notebook files: Use `notebook` MCP to modify.
