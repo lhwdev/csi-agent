@@ -36,8 +36,8 @@ def check_transition_vlm(obs: dict, current_step: int, task: str) -> Optional[in
     return None
 
 class MultiStepStrategy(BaseStrategy):
-    def __init__(self, step_idx: int, task: str):
-        super().__init__()
+    def __init__(self, config: BaseStrategyConfig, step_idx: int, task: str):
+        super().__init__(config)
         self.step_idx = step_idx
         self.task = task
         self.next_step_idx: Optional[int] = None
@@ -140,7 +140,7 @@ def rollout(
         )
         
         ctx = build_rollout_context(cfg, signal_handler.shutdown_event)
-        strategy = MultiStepStrategy(step_idx, task)
+        strategy = MultiStepStrategy(cfg.strategy, step_idx, task)
         
         try:
             strategy.setup(ctx)

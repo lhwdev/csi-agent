@@ -53,6 +53,8 @@ class CameraStreamer:
         self.server_thread = None
         self.server_port = None
         self.running = False
+        self.telemetry_lock = threading.Lock()
+        self.latest_telemetry = {"state": {}, "action": {}, "timestamp": 0.0}
         self.initialized = True
 
     def update_frame(self, cam_key, jpeg_bytes):
@@ -66,6 +68,47 @@ class CameraStreamer:
     def get_frame(self, cam_key):
         with self.frame_locks[cam_key]:
             return self.latest_frames[cam_key]
+
+    def update_telemetry(self, state, action):
+        sanitized_state = self._sanitize_dict(state)
+        sanitized_action = self._sanitize_dict(action)
+        with self.telemetry_lock:
+            self.latest_telemetry = {
+                "state": sanitized_state,
+                "action": sanitized_action,
+                "timestamp": time.time()
+            }
+
+    def get_telemetry(self):
+        with self.telemetry_lock:
+            return self.latest_telemetry
+
+    def _sanitize_dict(self, d):
+        if d is None:
+            return {}
+        import numpy as np
+        sanitized = {}
+        for k, v in d.items():
+            # Skip large media keys (e.g. camera image frames) to avoid bloating JSON
+            if k in ["left_cam", "top", "right_cam", "images", "pixels"]:
+                continue
+            
+            # Convert PyTorch tensors to numpy
+            if hasattr(v, "detach"):
+                v = v.detach().cpu()
+            if hasattr(v, "numpy"):
+                v = v.numpy()
+            
+            if isinstance(v, (np.ndarray, list)):
+                if hasattr(v, "tolist"):
+                    v = v.tolist()
+                sanitized[k] = v
+            else:
+                try:
+                    sanitized[k] = float(v)
+                except (TypeError, ValueError):
+                    sanitized[k] = str(v)
+        return sanitized
 
     def is_externally_updated(self, cam_key):
         # If frame was updated externally in the last 2.0 seconds, consider it active
@@ -234,6 +277,16 @@ class CameraStreamHandler(BaseHTTPRequestHandler):
         path = parsed_url.path
         query = parse_qs(parsed_url.query)
 
+        if path == "/telemetry":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            telemetry_data = streamer.get_telemetry()
+            import json
+            self.wfile.write(json.dumps(telemetry_data).encode("utf-8"))
+            return
+
         if path == "/":
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
@@ -245,6 +298,7 @@ class CameraStreamHandler(BaseHTTPRequestHandler):
     <meta charset="utf-8">
     <title>LeRobot 3-Camera Streamer</title>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root {
             --bg-color: hsl(220, 15%, 10%);
@@ -351,6 +405,52 @@ class CameraStreamHandler(BaseHTTPRequestHandler):
             height: 100%;
             object-fit: cover;
         }
+        .charts-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(450px, 1fr));
+            gap: 24px;
+            width: 100%;
+            max-width: 1400px;
+            margin-top: 32px;
+        }
+        .chart-card {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 20px;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
+            display: flex;
+            flex-direction: column;
+            position: relative;
+            overflow: hidden;
+        }
+        .chart-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+            background: var(--accent-glow);
+            opacity: 0.8;
+        }
+        .chart-title {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.25rem;
+            font-weight: 600;
+            margin-bottom: 4px;
+            color: var(--text-color);
+        }
+        .chart-subtitle {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin-bottom: 16px;
+        }
+        .chart-container {
+            position: relative;
+            width: 100%;
+            height: 300px;
+        }
         @keyframes pulse {
             0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
             70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
@@ -392,6 +492,11 @@ class CameraStreamHandler(BaseHTTPRequestHandler):
             </div>
         </div>
     </div>
+
+    <div class="charts-grid" id="charts-grid">
+        <!-- Dynamically created chart cards will go here -->
+    </div>
+
     <script>
         const select = document.getElementById('fps-select');
         const imgLeft = document.getElementById('left_cam_img');
@@ -403,10 +508,200 @@ class CameraStreamHandler(BaseHTTPRequestHandler):
             imgLeft.src = "/stream/left_cam?fps=" + fps;
             imgTop.src = "/stream/top?fps=" + fps;
             imgRight.src = "/stream/right_cam?fps=" + fps;
+            
+            // Synchronize telemetry polling FPS
+            resetTelemetryPolling(parseFloat(fps));
         }
         
         select.addEventListener('change', updateStreams);
-        // Initial set
+        
+        // --- Telemetry Graphing System ---
+        const charts = {}; // Keyed by arm/prefix (e.g. 'left', 'right', 'other')
+        const chartColors = [
+            'hsl(350, 80%, 60%)',  // Joint 0
+            'hsl(25, 85%, 55%)',   // Joint 1
+            'hsl(50, 90%, 50%)',   // Joint 2
+            'hsl(140, 75%, 50%)',  // Joint 3
+            'hsl(200, 85%, 55%)',  // Joint 4
+            'hsl(275, 80%, 60%)',  // Joint 5
+            'hsl(315, 80%, 60%)'   // Joint 6 (gripper)
+        ];
+        
+        let jointRegistry = [];
+        function getJointIndex(jointName) {
+            let idx = jointRegistry.indexOf(jointName);
+            if (idx === -1) {
+                idx = jointRegistry.length;
+                jointRegistry.push(jointName);
+            }
+            return idx;
+        }
+        
+        const historyLimit = 100;
+        let telemetryInterval = null;
+        
+        async function pollTelemetry() {
+            try {
+                const res = await fetch('/telemetry');
+                if (!res.ok) return;
+                const data = await res.json();
+                
+                const state = data.state || {};
+                const action = data.action || {};
+                
+                // Get all joint keys
+                const stateKeys = Object.keys(state).filter(k => k.endsWith('.pos'));
+                const actionKeys = Object.keys(action).filter(k => k.endsWith('.pos'));
+                const allKeys = Array.from(new Set([...stateKeys, ...actionKeys])).sort();
+                
+                if (allKeys.length === 0) return;
+                
+                // Group keys by prefix (e.g. 'left', 'right', 'other')
+                const groups = { left: [], right: [], other: [] };
+                allKeys.forEach(k => {
+                    if (k.startsWith('left_')) {
+                        groups.left.push(k);
+                    } else if (k.startsWith('right_')) {
+                        groups.right.push(k);
+                    } else {
+                        groups.other.push(k);
+                    }
+                });
+                
+                Object.keys(groups).forEach(groupName => {
+                    const keys = groups[groupName];
+                    if (keys.length === 0) return;
+                    
+                    ensureChartExists(groupName, keys);
+                    updateChartData(groupName, keys, state, action);
+                });
+            } catch (err) {
+                console.error("Telemetry fetch error:", err);
+            }
+        }
+        
+        function ensureChartExists(groupName, keys) {
+            if (charts[groupName]) return;
+            
+            const chartsGrid = document.getElementById('charts-grid');
+            const card = document.createElement('div');
+            card.className = 'chart-card';
+            
+            const titleText = groupName.charAt(0).toUpperCase() + groupName.slice(1) + " Arm Joint Tracking";
+            card.innerHTML = `
+                <div class="chart-title">${titleText}</div>
+                <div class="chart-subtitle">State (solid) vs. Action (dashed)</div>
+                <div class="chart-container">
+                    <canvas id="chart-${groupName}"></canvas>
+                </div>
+            `;
+            chartsGrid.appendChild(card);
+            
+            const datasets = [];
+            keys.forEach(k => {
+                let cleanName = k;
+                if (k.startsWith('left_')) cleanName = k.slice(5);
+                else if (k.startsWith('right_')) cleanName = k.slice(6);
+                cleanName = cleanName.split('.')[0];
+                
+                const colorIdx = getJointIndex(cleanName);
+                const color = chartColors[colorIdx % chartColors.length];
+                
+                // State dataset (solid)
+                datasets.push({
+                    label: `${cleanName} (State)`,
+                    data: [],
+                    borderColor: color,
+                    backgroundColor: color,
+                    borderWidth: 2,
+                    fill: false,
+                    tension: 0.1,
+                    pointRadius: 0,
+                    borderDash: []
+                });
+                
+                // Action dataset (dashed)
+                datasets.push({
+                    label: `${cleanName} (Action)`,
+                    data: [],
+                    borderColor: color,
+                    backgroundColor: color,
+                    borderWidth: 1.5,
+                    fill: false,
+                    tension: 0.1,
+                    pointRadius: 0,
+                    borderDash: [5, 5]
+                });
+            });
+            
+            const ctx = document.getElementById(`chart-${groupName}`).getContext('2d');
+            charts[groupName] = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: Array.from({length: historyLimit}, () => ""),
+                    datasets: datasets
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: false,
+                    plugins: {
+                        legend: {
+                            position: 'bottom',
+                            labels: {
+                                boxWidth: 15,
+                                color: '#e5e7eb',
+                                font: { family: 'Inter', size: 10 }
+                            }
+                        },
+                        tooltip: { mode: 'index', intersect: false }
+                    },
+                    scales: {
+                        x: { display: false, grid: { display: false } },
+                        y: {
+                            grid: { color: 'rgba(255, 255, 255, 0.08)' },
+                            ticks: { color: '#9ca3af', font: { family: 'Inter' } }
+                        }
+                    }
+                }
+            });
+        }
+        
+        function updateChartData(groupName, keys, state, action) {
+            const chart = charts[groupName];
+            if (!chart) return;
+            
+            keys.forEach((k, idx) => {
+                const stateVal = state[k] !== undefined ? state[k] : null;
+                const actionVal = action[k] !== undefined ? action[k] : null;
+                
+                const stateDatasetIdx = idx * 2;
+                const actionDatasetIdx = idx * 2 + 1;
+                
+                if (chart.data.datasets[stateDatasetIdx] && chart.data.datasets[actionDatasetIdx]) {
+                    const stateData = chart.data.datasets[stateDatasetIdx].data;
+                    const actionData = chart.data.datasets[actionDatasetIdx].data;
+                    
+                    stateData.push(stateVal);
+                    actionData.push(actionVal);
+                    
+                    if (stateData.length > historyLimit) stateData.shift();
+                    if (actionData.length > historyLimit) actionData.shift();
+                }
+            });
+            
+            chart.update('none');
+        }
+        
+        function resetTelemetryPolling(fps) {
+            if (telemetryInterval) {
+                clearInterval(telemetryInterval);
+            }
+            const intervalMs = Math.round(1000.0 / fps);
+            telemetryInterval = setInterval(pollTelemetry, intervalMs);
+        }
+        
+        // Initial streams set
         updateStreams();
     </script>
 </body>

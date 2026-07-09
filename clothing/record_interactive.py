@@ -79,7 +79,7 @@ def record_interactive(robot: Robot, leader: Teleoperator, params):
 
 
     # Stop background camera capture and start the streaming server
-    from camera_streamer import CameraStreamer
+    from lerobot_streamer import CameraStreamer
     streamer = CameraStreamer()
     streamer.stop_all_captures()
     streamer_port = streamer.start_server()
@@ -920,6 +920,8 @@ def record_interactive(robot: Robot, leader: Teleoperator, params):
                     obs = new_obs
                     raw_action = new_raw_action
                     consecutive_failures = 0
+                    
+                    streamer.update_telemetry(obs, raw_action)
                     
                     # 2. Always teleoperate so follower mirrors leader
                     obs_processed = robot_observation_processor(obs)
