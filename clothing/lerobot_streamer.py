@@ -14,6 +14,15 @@ class CameraStreamer:
     _instance = None
     _lock = threading.RLock()
     _listeners = []
+    enabled = False
+
+    @classmethod
+    def disable(cls):
+        cls.enabled = False
+
+    @classmethod
+    def enable(cls):
+        cls.enabled = True
 
     def listen_change(cls, listener):
         _listeners.append(listener)
@@ -60,6 +69,8 @@ class CameraStreamer:
 
     def update_frame(self, cam_key, jpeg_bytes):
         """Called externally to push frames (e.g. from robot loop)."""
+        if not self.enabled:
+            return
         if cam_key not in self.latest_frames:
             return
         with self.frame_locks[cam_key]:
@@ -71,6 +82,8 @@ class CameraStreamer:
             return self.latest_frames[cam_key]
 
     def update_telemetry(self, state, action):
+        if not self.enabled:
+            return
         sanitized_state = self._sanitize_dict(state)
         sanitized_action = self._sanitize_dict(action)
         with self.telemetry_lock:
@@ -116,6 +129,8 @@ class CameraStreamer:
         return (time.time() - self.last_update_time[cam_key]) < 2.0
 
     def client_connected(self, cam_key):
+        if not self.enabled:
+            return
         with self._lock:
             self.active_clients[cam_key] += 1
             is_ext = self.is_externally_updated(cam_key)
@@ -124,6 +139,8 @@ class CameraStreamer:
                 self.start_capture_thread(cam_key)
 
     def client_disconnected(self, cam_key):
+        if not self.enabled:
+            return
         with self._lock:
             if self.active_clients[cam_key] > 0:
                 self.active_clients[cam_key] -= 1
@@ -131,6 +148,8 @@ class CameraStreamer:
                 self.stop_capture_thread(cam_key)
 
     def start_capture_thread(self, cam_key):
+        if not self.enabled:
+            return
         self.capture_running[cam_key] = True
         thread = threading.Thread(
             target=self._capture_loop, 
@@ -142,6 +161,8 @@ class CameraStreamer:
         thread.start()
 
     def stop_capture_thread(self, cam_key):
+        if not self.enabled:
+            return
         self.capture_running[cam_key] = False
         thread = self.capture_threads.get(cam_key)
         if thread:
@@ -151,6 +172,8 @@ class CameraStreamer:
 
     def stop_all_captures(self):
         """Stops all active camera device reading threads (to release resources for teleop)."""
+        if not self.enabled:
+            return
         with self._lock:
             for cam_key in list(self.capture_threads.keys()):
                 self.capture_running[cam_key] = False
@@ -214,6 +237,8 @@ class CameraStreamer:
             cap.release()
 
     def start_server(self):
+        if not self.enabled:
+            return None
         with self._lock:
             if self.server is not None:
                 return self.server_port
@@ -241,6 +266,8 @@ class CameraStreamer:
             return self.server_port
 
     def stop_server(self):
+        if not self.enabled:
+            return
         server_to_shutdown = None
         with self._lock:
             if self.server is not None:

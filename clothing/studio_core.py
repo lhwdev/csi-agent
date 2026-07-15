@@ -367,7 +367,20 @@ class BaseInteractiveStudio:
         log_content = "<br/>".join(reversed(self.log_messages))
         self.log_widget.value = f'<div class="log-area">{log_content}</div>'
 
+    def update_header(self):
+        if hasattr(self, 'header_widget') and self.steps_val and self.current_dataset_step_idx < len(self.steps_val):
+            step = self.steps_val[self.current_dataset_step_idx]
+            repo_id = step.get("repo_id", "")
+            root_dir = step.get("root_dir", "")
+            self.header_widget.value = f"""
+            <div class="studio-header">
+                <div class="studio-title">{repo_id}</div>
+                <div class="studio-subtitle">{root_dir}</div>
+            </div>
+            """
+
     def update_status_card(self):
+        self.update_header()
         # Override in subclasses for specific states
         state_class = "status-idle"
         fps_text = f" | {self.current_fps:.1f} FPS" if getattr(self, 'current_fps', 0) > 0 else ""

@@ -2,7 +2,8 @@ This file provides guidance to AI agents when working with code in this workspac
 
 ## Project
 
-This project aims to use so101_follower and so101_leader lobots to achieve VLA-based imitation learning.
+This project aims to use bi_so_follower(two so101_follower) and bi_so_leader(two so101_leader)
+robots + cv2 cameras (top, left, right) to achieve VLA-based imitation learning.
 
 ## Environment
 
@@ -14,7 +15,7 @@ Refer to `../lerobot/AGENT_GUIDE.md` for more details about lerobot codebase.
 
 - primary coding workspace: `./`
 - lerobot repository: `../lerobot`. Do NOT modify this, unless you are sure that lerobot codebase
-  itself contains bug or problem.
+  itself contains bug or problem or you are asked to.
 
 ## Tooling
 

@@ -67,6 +67,15 @@ def train_generic(
         revision=dataset.revision,
     )
 
+    from torch.utils.data import default_collate
+    
+    def custom_collate_fn(batch):
+        cleaned_batch = []
+        for item in batch:
+            cleaned_item = {k: (0 if v is None else v) for k, v in item.items()}
+            cleaned_batch.append(cleaned_item)
+        return default_collate(cleaned_batch)
+
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=4,
@@ -75,6 +84,7 @@ def train_generic(
         sampler=sampler,
         pin_memory=device.type != "cpu",
         drop_last=True,
+        collate_fn=custom_collate_fn,
     )
 
     # Instantiate validation dataset and dataloader if provided
@@ -95,6 +105,7 @@ def train_generic(
             shuffle=False,
             pin_memory=device.type != "cpu",
             drop_last=False,
+            collate_fn=custom_collate_fn,
         )
 
     # Build task mapping for datasets without language columns
@@ -294,10 +305,14 @@ def train_dagger(
 
     normalized_rounds = []
     for r in rounds:
-        if isinstance(r, list) or isinstance(r, tuple):
-            normalized_rounds.append(int(r[0]))
-        else:
-            normalized_rounds.append(int(r))
+        if r is None:
+            normalized_rounds.append(0)
+            continue
+        r_val = r[0] if (isinstance(r, list) or isinstance(r, tuple)) else r
+        if r_val is None:
+            normalized_rounds.append(0)
+            continue
+        normalized_rounds.append(int(r_val))
 
     total_frames = len(normalized_rounds)
     round_0_indices = [i for i, r in enumerate(normalized_rounds) if r == 0]

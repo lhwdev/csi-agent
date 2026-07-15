@@ -148,6 +148,7 @@ class RecordInteractiveStudio(BaseInteractiveStudio):
         self.shortcut_input.observe(on_shortcut_change, names='value')
 
     def update_status_card(self):
+        self.update_header()
         state_classes = {
             "IDLE": "status-idle",
             "RECORDING": "status-recording",
@@ -354,8 +355,25 @@ class RecordInteractiveStudio(BaseInteractiveStudio):
         try:
             for idx, ds in enumerate(self.datasets):
                 await asyncio.to_thread(ds.save_episode)
-                await asyncio.to_thread(ds.finalize)
-            self.add_log(f"Episode {self.current_episode_idx} finalized on disk for all steps.")
+                
+                def flush_ds(ds):
+                    if hasattr(ds, "writer") and ds.writer is not None:
+                        w = ds.writer
+                        if hasattr(w, "close_writer"):
+                            w.close_writer()
+                        if hasattr(w, "_meta") and hasattr(w._meta, "_close_writer"):
+                            w._meta._close_writer()
+                        if hasattr(w, "_latest_episode") and w._latest_episode is not None:
+                            from lerobot.datasets.utils import update_chunk_file_indices
+                            c, f = w._latest_episode["data/chunk_index"], w._latest_episode["data/file_index"]
+                            c, f = update_chunk_file_indices(c, f, w._meta.chunks_size)
+                            w._latest_episode["data/chunk_index"] = c
+                            w._latest_episode["data/file_index"] = f
+                            w._current_file_start_frame = w._latest_episode["index"][-1] + 1
+                            
+                await asyncio.to_thread(flush_ds, ds)
+                
+            self.add_log(f"Episode {self.current_episode_idx} saved on disk for all steps.")
             
             self.current_episode_idx += 1
             self.episode_progress.value = self.current_episode_idx
@@ -365,17 +383,6 @@ class RecordInteractiveStudio(BaseInteractiveStudio):
                 await self.finalize_dataset_async()
                 self.keep_running = False
             else:
-                self.add_log("Preparing writer for next episode...")
-                for idx, ds in enumerate(self.datasets):
-                    repo_id = self.steps_val[idx]["repo_id"]
-                    root_dir = self.steps_val[idx]["root_dir"]
-                    self.datasets[idx] = await asyncio.to_thread(
-                        LeRobotDataset.resume,
-                        repo_id=repo_id,
-                        root=root_dir,
-                        streaming_encoding=True
-                    )
-                
                 self.recording_state = "IDLE"
                 self.current_dataset_step_idx = 0
                 self.update_status_card()
