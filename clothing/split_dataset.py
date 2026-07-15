@@ -5,6 +5,7 @@ def split_dataset(
     dataset: LeRobotDataset,
     val_ratio: float = 0.1,
     seed: int = 42,
+    force_train_episodes: set[int] | None = None,
 ) -> tuple[LeRobotDataset, LeRobotDataset | None]:
     """
     Splits a LeRobotDataset on the fly into training and validation datasets
@@ -36,6 +37,10 @@ def split_dataset(
     val_episodes = []
 
     for ep_idx in episodes:
+        if force_train_episodes is not None and ep_idx in force_train_episodes:
+            train_episodes.append(ep_idx)
+            continue
+            
         # Generate a deterministic hash of the seed and the episode index
         hash_input = f"{seed}_{ep_idx}".encode("utf-8")
         hash_val = int(hashlib.md5(hash_input).hexdigest(), 16)

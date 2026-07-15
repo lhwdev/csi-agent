@@ -1,0 +1,220 @@
+<div class="nb-charts-widget-container" style="background: #ffffff; border: 1px solid #dee2e6; border-radius: 12px; padding: 12px; font-family: 'Inter', sans-serif;">
+    <div id="nb-charts-grid-{unique_id}" style="display: flex; flex-direction: column; gap: 12px;">
+        <!-- Dynamic charts will go here -->
+    </div>
+</div>
+
+<script>
+(function() {
+    function initCharts() {
+        const dataEl = document.querySelector('.{unique_id}');
+        const gridEl = document.getElementById('nb-charts-grid-{unique_id}');
+        if (!dataEl || !gridEl) {
+            setTimeout(initCharts, 100);
+            return;
+        }
+        
+        const charts = {};
+        const historyLimit = 50;
+        const chartColors = [
+            'hsl(350, 80%, 60%)',  // Joint 0
+            'hsl(25, 85%, 55%)',   // Joint 1
+            'hsl(50, 90%, 50%)',   // Joint 2
+            'hsl(140, 75%, 50%)',  // Joint 3
+            'hsl(200, 85%, 55%)',  // Joint 4
+            'hsl(275, 80%, 60%)',  // Joint 5
+            'hsl(315, 80%, 60%)'   // Joint 6 (gripper)
+        ];
+        let jointRegistry = [];
+        
+        function getJointIndex(jointName) {
+            let idx = jointRegistry.indexOf(jointName);
+            if (idx === -1) {
+                idx = jointRegistry.length;
+                jointRegistry.push(jointName);
+            }
+            return idx;
+        }
+        
+        function ensureChartExists(groupName, keys) {
+            if (charts[groupName]) return;
+            
+            const card = document.createElement('div');
+            card.className = 'nb-chart-card';
+            card.style.background = '#f8f9fa';
+            card.style.border = '1px solid #e9ecef';
+            card.style.borderRadius = '10px';
+            card.style.padding = '10px';
+            
+            const titleText = groupName.charAt(0).toUpperCase() + groupName.slice(1) + " Arm Joint Tracking";
+            card.innerHTML = '<div class="nb-chart-title" style="font-family: \'Outfit\', sans-serif; font-size: 13px; font-weight: 600; margin-bottom: 2px; color: #212529;">' + titleText + '</div>' +
+                             '<div class="nb-chart-subtitle" style="font-size: 10px; color: #6c757d; margin-bottom: 8px;">State (solid) vs. Action (dashed)</div>' +
+                             '<div class="nb-chart-container" style="position: relative; width: 100%; height: 160px;">' +
+                             '  <canvas id="nb-chart-' + groupName + '-{unique_id}"></canvas>' +
+                             '</div>';
+            gridEl.appendChild(card);
+            
+            const datasets = [];
+            keys.forEach(k => {
+                let cleanName = k;
+                if (k.startsWith('left_')) cleanName = k.slice(5);
+                else if (k.startsWith('right_')) cleanName = k.slice(6);
+                cleanName = cleanName.split('.')[0];
+                
+                const colorIdx = getJointIndex(cleanName);
+                const color = chartColors[colorIdx % chartColors.length];
+                
+                // State dataset (solid)
+                datasets.push({
+                    label: cleanName + " (S)",
+                    data: [],
+                    borderColor: color,
+                    backgroundColor: color,
+                    borderWidth: 2,
+                    fill: false,
+                    tension: 0.1,
+                    pointRadius: 0,
+                    borderDash: []
+                });
+                
+                // Action dataset (dashed)
+                datasets.push({
+                    label: cleanName + " (A)",
+                    data: [],
+                    borderColor: color,
+                    backgroundColor: color,
+                    borderWidth: 1.5,
+                    fill: false,
+                    tension: 0.1,
+                    pointRadius: 0,
+                    borderDash: [4, 4]
+                });
+            });
+            
+            const ctx = document.getElementById('nb-chart-' + groupName + '-{unique_id}').getContext('2d');
+            charts[groupName] = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: Array.from({length: historyLimit}, () => ""),
+                    datasets: datasets
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: false,
+                    plugins: {
+                        legend: {
+                            position: 'bottom',
+                            labels: {
+                                boxWidth: 10,
+                                color: '#495057',
+                                font: { family: 'Inter', size: 9 }
+                            }
+                        },
+                        tooltip: { mode: 'index', intersect: false }
+                    },
+                    scales: {
+                        x: { display: false, grid: { display: false } },
+                        y: {
+                            grid: { color: 'rgba(0, 0, 0, 0.05)' },
+                            ticks: { color: '#495057', font: { family: 'Inter', size: 9 } }
+                        }
+                    }
+                }
+            });
+        }
+        
+        function updateChartData(groupName, keys, state, action) {
+            const chart = charts[groupName];
+            if (!chart) return;
+            
+            keys.forEach((k, idx) => {
+                const stateVal = state[k] !== undefined ? state[k] : null;
+                const actionVal = action[k] !== undefined ? action[k] : null;
+                
+                const stateDatasetIdx = idx * 2;
+                const actionDatasetIdx = idx * 2 + 1;
+                
+                if (chart.data.datasets[stateDatasetIdx] && chart.data.datasets[actionDatasetIdx]) {
+                    const stateData = chart.data.datasets[stateDatasetIdx].data;
+                    const actionData = chart.data.datasets[actionDatasetIdx].data;
+                    
+                    stateData.push(stateVal);
+                    actionData.push(actionVal);
+                    
+                    if (stateData.length > historyLimit) stateData.shift();
+                    if (actionData.length > historyLimit) actionData.shift();
+                }
+            });
+            
+            chart.update('none');
+        }
+        
+        function processData(text) {
+            try {
+                const data = JSON.parse(text);
+                const state = data.state || {};
+                const action = data.action || {};
+                
+                const stateKeys = Object.keys(state).filter(k => k.endsWith('.pos'));
+                const actionKeys = Object.keys(action).filter(k => k.endsWith('.pos'));
+                const allKeys = Array.from(new Set([...stateKeys, ...actionKeys])).sort();
+                
+                if (allKeys.length === 0) return;
+                
+                // If the tab was hidden and now becomes visible, we must resize the chart
+                Object.keys(charts).forEach(g => {
+                    const ch = charts[g];
+                    const canvas = document.getElementById('nb-chart-' + g + '-{unique_id}');
+                    if (canvas && canvas.clientWidth > 0 && (ch.width === 0 || ch.height === 0)) {
+                        ch.resize();
+                    }
+                });
+                
+                const groups = { left: [], right: [], other: [] };
+                allKeys.forEach(k => {
+                    if (k.startsWith('left_')) {
+                        groups.left.push(k);
+                    } else if (k.startsWith('right_')) {
+                        groups.right.push(k);
+                    } else {
+                        groups.other.push(k);
+                    }
+                });
+                
+                Object.keys(groups).forEach(groupName => {
+                    const keys = groups[groupName];
+                    if (keys.length === 0) return;
+                    
+                    ensureChartExists(groupName, keys);
+                    updateChartData(groupName, keys, state, action);
+                });
+            } catch (e) {
+                console.error("Error parsing telemetry json:", e);
+            }
+        }
+        
+        const observer = new MutationObserver((mutations) => {
+            let text = dataEl.textContent || dataEl.innerText;
+            if (text) {
+                processData(text.trim());
+            }
+        });
+        observer.observe(dataEl, { childList: true, characterData: true, subtree: true });
+        
+        let initialText = dataEl.textContent || dataEl.innerText;
+        if (initialText && initialText.trim().length > 2) {
+            processData(initialText.trim());
+        }
+    }
+    
+    if (typeof window.Chart === 'undefined') {
+        const script = document.createElement('script');
+        script.src = 'https://cdn.jsdelivr.net/npm/chart.js';
+        script.onload = initCharts;
+        document.head.appendChild(script);
+    } else {
+        initCharts();
+    }
+})();
+</script>

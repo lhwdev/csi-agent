@@ -28,6 +28,8 @@ def train_generic(
     val_dataset: LeRobotDataset | None = None,
     device: torch.device = None,
     batch_transform: Callable[[dict], dict] | None = None,
+    optimizer: torch.optim.Optimizer | None = None,
+    sampler: torch.utils.data.Sampler | None = None,
 ):
     # 1. Output directory
     output_directory = Path(train_params.output_directory)
@@ -39,6 +41,10 @@ def train_generic(
     cfg.device = str(device)
     policy.to(device)
     policy.train()
+
+    if getattr(train_params, "compile", False) and not hasattr(policy, "_orig_mod"):
+        print("Compiling policy with torch.compile()...")
+        policy = torch.compile(policy, mode="reduce-overhead")
 
     # Create processors
     preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset.meta.stats)
@@ -65,7 +71,8 @@ def train_generic(
         dataset,
         num_workers=4,
         batch_size=train_params.batch_size,
-        shuffle=True,
+        shuffle=(sampler is None),
+        sampler=sampler,
         pin_memory=device.type != "cpu",
         drop_last=True,
     )
@@ -105,19 +112,20 @@ def train_generic(
     if (last_checkpoint_dir / "state.json").exists():
         with open(last_checkpoint_dir / "state.json", "r") as f:
             state = json.load(f)
-        start_step = state["step"]
+        start_step = state.get("step", 0)
 
-    # Create optimizer
-    trainable_params = [p for p in policy.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(
-        trainable_params,
-        lr=cfg.optimizer_lr,
-        weight_decay=cfg.optimizer_weight_decay,
-        betas=getattr(cfg, "optimizer_betas", (0.9, 0.999)),
-        eps=getattr(cfg, "optimizer_eps", 1e-8),
-    )
-    if start_step > 0:
-        optimizer.load_state_dict(torch.load(last_checkpoint_dir / "optimizer.pt", map_location=device))
+    if optimizer is None:
+        # Create optimizer
+        trainable_params = [p for p in policy.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=cfg.optimizer_lr,
+            weight_decay=cfg.optimizer_weight_decay,
+            betas=getattr(cfg, "optimizer_betas", (0.9, 0.999)),
+            eps=getattr(cfg, "optimizer_eps", 1e-8),
+        )
+        if start_step > 0 and (last_checkpoint_dir / "optimizer.pt").exists():
+            optimizer.load_state_dict(torch.load(last_checkpoint_dir / "optimizer.pt", map_location=device))
 
     # Run training loop
     step = start_step
@@ -160,21 +168,11 @@ def train_generic(
                 if k.startswith("observation.images.") and not k.endswith("_is_pad") and isinstance(batch[k], torch.Tensor):
                     tensor = batch[k]
                     if tensor.ndim == 4:  # [B, C, H, W]
-                        augmented_imgs = []
-                        for img in tensor:
-                            img = color_jitter(img)
-                            img = affine(img)
-                            augmented_imgs.append(img)
-                        batch[k] = torch.stack(augmented_imgs)
+                        batch[k] = affine(color_jitter(tensor))
                     elif tensor.ndim == 5:  # [B, T, C, H, W]
                         B, T_dim, C, H, W = tensor.shape
                         flat_tensor = tensor.view(B * T_dim, C, H, W)
-                        augmented_imgs = []
-                        for img in flat_tensor:
-                            img = color_jitter(img)
-                            img = affine(img)
-                            augmented_imgs.append(img)
-                        batch[k] = torch.stack(augmented_imgs).view(B, T_dim, C, H, W)
+                        batch[k] = affine(color_jitter(flat_tensor)).view(B, T_dim, C, H, W)
 
             # Preprocess batch
             batch = preprocessor(batch)
@@ -271,6 +269,86 @@ def train_generic(
                 break
 
     progress_bar.close()
+
+
+def train_dagger(
+    policy,
+    cfg,
+    train_params,
+    dataset: LeRobotDataset,
+    current_training_round: int,
+    val_dataset: LeRobotDataset | None = None,
+    device: torch.device = None,
+    batch_transform: Callable[[dict], dict] | None = None,
+    optimizer: torch.optim.Optimizer | None = None,
+):
+    alpha = getattr(train_params, "dagger_rehearsal_alpha", 0.5) # % of original dataset
+    beta = getattr(train_params, "dagger_rehearsal_beta", 0.3) # % of current round expert dataset
+    
+    # Analyze dataset rounds
+    hf_dataset = dataset.hf_dataset
+    if "round" in hf_dataset.column_names:
+        rounds = hf_dataset["round"]
+    else:
+        rounds = [0] * len(hf_dataset)
+
+    normalized_rounds = []
+    for r in rounds:
+        if isinstance(r, list) or isinstance(r, tuple):
+            normalized_rounds.append(int(r[0]))
+        else:
+            normalized_rounds.append(int(r))
+
+    total_frames = len(normalized_rounds)
+    round_0_indices = [i for i, r in enumerate(normalized_rounds) if r == 0]
+    round_N_indices = [i for i, r in enumerate(normalized_rounds) if r == current_training_round]
+    round_past_indices = [i for i, r in enumerate(normalized_rounds) if 0 < r < current_training_round]
+
+    count_0 = len(round_0_indices)
+    count_N = len(round_N_indices)
+    count_past = len(round_past_indices)
+
+    print(f"DAgger dataset composition: Round 0: {count_0}, Round N({current_training_round}): {count_N}, Past Rounds: {count_past}")
+
+    weights = [0.0] * total_frames
+    
+    if count_N == 0:
+        sampler = None
+    else:
+        if current_training_round == 1:
+            prob_0 = alpha
+            prob_N = 1.0 - alpha
+            prob_past = 0.0
+        else:
+            prob_0 = alpha
+            prob_N = beta
+            prob_past = 1.0 - alpha - beta
+
+        w_0 = prob_0 / count_0 if count_0 > 0 else 0
+        w_N = prob_N / count_N if count_N > 0 else 0
+        w_past = prob_past / count_past if count_past > 0 else 0
+
+        for i in round_0_indices: weights[i] = w_0
+        for i in round_N_indices: weights[i] = w_N
+        for i in round_past_indices: weights[i] = w_past
+
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=weights,
+            num_samples=train_params.training_steps * train_params.batch_size,
+            replacement=True
+        )
+
+    train_generic(
+        policy=policy,
+        cfg=cfg,
+        train_params=train_params,
+        dataset=dataset,
+        val_dataset=val_dataset,
+        device=device,
+        batch_transform=batch_transform,
+        optimizer=optimizer,
+        sampler=sampler
+    )
 
 
 def train_simple_act(train_params, dataset: LeRobotDataset, val_dataset: LeRobotDataset | None = None):

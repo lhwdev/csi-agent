@@ -94,6 +94,49 @@ class MultiStepStrategy(BaseStrategy):
             self._engine.stop()
         logger.info(f"MultiStepStrategy teardown complete for step {self.step_idx}")
 
+def create_rollout_context(
+    robot: RobotConfig | Robot,
+    policy: PreTrainedConfig,
+    task: str,
+    fps: float,
+    asynchronous: bool = True,
+    compile: bool = True,
+    rename_map: Optional[dict[str, str]] = None,
+    shutdown_event = None,
+    teleop_action_processor = None,
+    robot_action_processor = None,
+    robot_observation_processor = None,
+) -> RolloutContext:
+    inference_config = RTCInferenceConfig() if asynchronous else SyncInferenceConfig()
+    
+    # IMPROVEMENT: Enable temporal ensembling for ACT policy to prevent shaking
+    if policy.type == "act":
+        if getattr(policy, "temporal_ensemble_coeff", None) is None:
+            policy.temporal_ensemble_coeff = 0.1
+            policy.n_action_steps = 1
+            
+    cfg = RolloutConfig(
+        robot=robot,
+        policy=policy,
+        strategy=BaseStrategyConfig(),
+        inference=inference_config,
+        fps=fps,
+        task=task,
+        use_torch_compile=compile,  # Optimizes model execution latency 
+        device="xpu",
+        interpolation_multiplier=2,
+        rename_map=rename_map or {},
+    )
+    import threading
+    event = shutdown_event or threading.Event()
+    return build_rollout_context(
+        cfg, 
+        event,
+        teleop_action_processor=teleop_action_processor,
+        robot_action_processor=robot_action_processor,
+        robot_observation_processor=robot_observation_processor,
+    )
+
 def rollout(
     robot: RobotConfig | Robot,
     policies: list[PreTrainedConfig],
@@ -101,11 +144,10 @@ def rollout(
     fps: float,
     asynchronous: bool = True,
     compile: bool = True,
+    rename_map: Optional[dict[str, str]] = None,
 ):
     init_logging()
     register_third_party_plugins()
-    
-    inference_config = RTCInferenceConfig() if asynchronous else SyncInferenceConfig()
     
     signal_handler = ProcessSignalHandler(use_threads=True, display_pid=False)
     
@@ -114,33 +156,24 @@ def rollout(
         robot = robot.build()
     if not robot.is_connected:
         robot.connect()
-
+ 
     step_idx = 0
     while 0 <= step_idx < len(policies):
         policy = policies[step_idx]
         task = tasks[step_idx]
         print(f"=== Running Policy Step {step_idx}: {task} ===")
         
-        # IMPROVEMENT: Enable temporal ensembling for ACT policy to prevent shaking
-        if policy.type == "act":
-            if getattr(policy, "temporal_ensemble_coeff", None) is None:
-                policy.temporal_ensemble_coeff = 0.1
-                policy.n_action_steps = 1
-            
-        cfg = RolloutConfig(
+        ctx = create_rollout_context(
             robot=robot,
             policy=policy,
-            strategy=BaseStrategyConfig(),
-            inference=inference_config,
-            fps=fps,
             task=task,
-            use_torch_compile=compile,  # Optimizes model execution latency 
-            device="xpu",
-            interpolation_multiplier=2,
+            fps=fps,
+            asynchronous=asynchronous,
+            compile=compile,
+            rename_map=rename_map,
+            shutdown_event=signal_handler.shutdown_event
         )
-        
-        ctx = build_rollout_context(cfg, signal_handler.shutdown_event)
-        strategy = MultiStepStrategy(cfg.strategy, step_idx, task)
+        strategy = MultiStepStrategy(ctx.runtime.cfg.strategy, step_idx, task)
         
         try:
             strategy.setup(ctx)

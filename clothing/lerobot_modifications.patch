@@ -74,27 +74,59 @@ index 8ae57fe3..f1b704e6 100644
  
      def __post_init__(self) -> None:
          self.color_mode = ColorMode(self.color_mode)
+diff --git a/src/lerobot/policies/act/modeling_act.py b/src/lerobot/policies/act/modeling_act.py
+index 1432b68a..02f657a6 100644
+--- a/src/lerobot/policies/act/modeling_act.py
++++ b/src/lerobot/policies/act/modeling_act.py
+@@ -64,6 +64,8 @@ class ACTPolicy(PreTrainedPolicy):
+ 
+         self.model = ACT(config)
+ 
++        # self.model = torch.compile(self.model, mode="reduce-overhead")
++
+         if config.temporal_ensemble_coeff is not None:
+             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
+ 
+@@ -123,7 +125,7 @@ class ACTPolicy(PreTrainedPolicy):
+         return self._action_queue.popleft()
+ 
+     @torch.no_grad()
+-    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
++    def predict_action_chunk(self, batch: dict[str, Tensor], **KWARGS) -> Tensor:
+         """Predict a chunk of actions given environment observations."""
+         self.eval()
+ 
 diff --git a/src/lerobot/rollout/configs.py b/src/lerobot/rollout/configs.py
-index 60c47cfb..9638dd38 100644
+index 60c47cfb..eddeb277 100644
 --- a/src/lerobot/rollout/configs.py
 +++ b/src/lerobot/rollout/configs.py
-@@ -19,6 +19,10 @@ from __future__ import annotations
+@@ -19,6 +19,8 @@ from __future__ import annotations
  import abc
  import logging
  from dataclasses import dataclass, field
 +from typing import TYPE_CHECKING
-+
-+if TYPE_CHECKING:
-+    from lerobot.robots.robot import Robot
++from lerobot.robots.robot import Robot
  
  import draccus
  
-@@ -204,7 +208,7 @@ class RolloutConfig:
+@@ -30,6 +32,11 @@ from lerobot.utils.device_utils import auto_select_torch_device, is_torch_device
+ 
+ from .inference import InferenceEngineConfig, SyncInferenceConfig
+ 
++if TYPE_CHECKING:
++    RobotFieldType = RobotConfig | Robot | None
++else:
++    RobotFieldType = RobotConfig | None
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -204,7 +211,7 @@ class RolloutConfig:
      """
  
      # Hardware
 -    robot: RobotConfig | None = None
-+    robot: RobotConfig | Robot | None = None
++    robot: RobotFieldType = None
      teleop: TeleoperatorConfig | None = None
  
      # Policy (loaded from --policy.path via __post_init__)
@@ -153,3 +185,33 @@ index 9c897522..64ee7b38 100644
          teleop = hw.teleop
          if teleop is not None and teleop.is_connected:
              logger.info("Disconnecting teleoperator...")
+diff --git a/src/lerobot/teleoperators/bi_so_leader/bi_so_leader.py b/src/lerobot/teleoperators/bi_so_leader/bi_so_leader.py
+index 6a45b4d9..e1ecc565 100644
+--- a/src/lerobot/teleoperators/bi_so_leader/bi_so_leader.py
++++ b/src/lerobot/teleoperators/bi_so_leader/bi_so_leader.py
+@@ -88,5 +88,23 @@ class BiSOLeader(BimanualMixin, Teleoperator):
+         return action_dict
+ 
+     def send_feedback(self, feedback: dict[str, float]) -> None:
+-        # TODO: Implement force feedback
+-        raise NotImplementedError
++        left_feedback = {}
++        right_feedback = {}
++        for key, value in feedback.items():
++            if key.startswith("left_"):
++                left_feedback[key.removeprefix("left_")] = value
++            elif key.startswith("right_"):
++                right_feedback[key.removeprefix("right_")] = value
++        
++        if left_feedback:
++            self.left_arm.send_feedback(left_feedback)
++        if right_feedback:
++            self.right_arm.send_feedback(right_feedback)
++
++    def enable_torque(self) -> None:
++        self.left_arm.enable_torque()
++        self.right_arm.enable_torque()
++
++    def disable_torque(self) -> None:
++        self.left_arm.disable_torque()
++        self.right_arm.disable_torque()
