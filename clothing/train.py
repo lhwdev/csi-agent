@@ -20,17 +20,36 @@ from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.utils.feature_utils import dataset_to_policy_features
 
 
+from dataclasses import dataclass
+
+@dataclass
+class TrainMiscArgs:
+    device: torch.device | None = None
+    batch_transform: Callable[[dict], dict] | None = None
+    optimizer: torch.optim.Optimizer | None = None
+    sampler: torch.utils.data.Sampler | None = None
+    progress_callback: Callable[[dict], None] | None = None
+
+
 def train_generic(
     policy,
     cfg,
     train_params,
     dataset: LeRobotDataset,
     val_dataset: LeRobotDataset | None = None,
-    device: torch.device = None,
-    batch_transform: Callable[[dict], dict] | None = None,
-    optimizer: torch.optim.Optimizer | None = None,
-    sampler: torch.utils.data.Sampler | None = None,
+    misc_args: TrainMiscArgs | None = None,
 ):
+    if misc_args is None:
+        misc_args = TrainMiscArgs()
+
+    device = misc_args.device
+    if device is None:
+        device = torch.device("xpu" if torch.xpu.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
+
+    batch_transform = misc_args.batch_transform
+    optimizer = misc_args.optimizer
+    sampler = misc_args.sampler
+
     # 1. Output directory
     output_directory = Path(train_params.output_directory)
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -70,11 +89,71 @@ def train_generic(
     from torch.utils.data import default_collate
     
     def custom_collate_fn(batch):
+        # Fast-path if there are no None values
+        has_none = False
+        for item in batch:
+            for v in item.values():
+                if v is None:
+                    has_none = True
+                    break
+            if has_none:
+                break
+        if not has_none:
+            return default_collate(batch)
+
+        # Find exemplars in batch to get correct tensor types/shapes
+        exemplars = {}
+        for item in batch:
+            for k, v in item.items():
+                if k not in exemplars and v is not None:
+                    exemplars[k] = v
+
         cleaned_batch = []
         for item in batch:
-            cleaned_item = {k: (0 if v is None else v) for k, v in item.items()}
+            cleaned_item = {}
+            for k, v in item.items():
+                if v is not None:
+                    cleaned_item[k] = v
+                else:
+                    # v is None, construct a proper fallback tensor/value
+                    if k in exemplars:
+                        ex = exemplars[k]
+                        if isinstance(ex, torch.Tensor):
+                            cleaned_item[k] = torch.zeros_like(ex)
+                        elif isinstance(ex, (int, float, bool)):
+                            cleaned_item[k] = type(ex)(0)
+                        else:
+                            cleaned_item[k] = 0
+                    else:
+                        # Fallback using dataset features
+                        if k in dataset.features:
+                            ft = dataset.features[k]
+                            shape = ft.get("shape", (1,))
+                            dtype_str = ft.get("dtype", "float32")
+                            
+                            # Handle video/image shape conversion ([H, W, C] -> [C, H, W])
+                            if dtype_str in ["video", "image"]:
+                                if len(shape) == 3:
+                                    shape = [shape[2], shape[0], shape[1]]
+                                dtype = torch.float32
+                            else:
+                                dtype = {
+                                    "bool": torch.bool,
+                                    "float32": torch.float32,
+                                    "float64": torch.float64,
+                                    "int8": torch.int8,
+                                    "int16": torch.int16,
+                                    "int32": torch.int32,
+                                    "int64": torch.int64,
+                                    "uint8": torch.uint8,
+                                }.get(dtype_str, torch.float32)
+                            
+                            cleaned_item[k] = torch.zeros(shape, dtype=dtype)
+                        else:
+                            cleaned_item[k] = torch.tensor(0)
             cleaned_batch.append(cleaned_item)
         return default_collate(cleaned_batch)
+
 
     dataloader = torch.utils.data.DataLoader(
         dataset,
@@ -83,6 +162,7 @@ def train_generic(
         shuffle=(sampler is None),
         sampler=sampler,
         pin_memory=device.type != "cpu",
+        persistent_workers=True,
         drop_last=True,
         collate_fn=custom_collate_fn,
     )
@@ -104,6 +184,7 @@ def train_generic(
             batch_size=train_params.batch_size,
             shuffle=False,
             pin_memory=device.type != "cpu",
+            persistent_workers=True,
             drop_last=False,
             collate_fn=custom_collate_fn,
         )
@@ -134,6 +215,7 @@ def train_generic(
             weight_decay=cfg.optimizer_weight_decay,
             betas=getattr(cfg, "optimizer_betas", (0.9, 0.999)),
             eps=getattr(cfg, "optimizer_eps", 1e-8),
+            fused=device.type in ("cuda", "xpu"),
         )
         if start_step > 0 and (last_checkpoint_dir / "optimizer.pt").exists():
             optimizer.load_state_dict(torch.load(last_checkpoint_dir / "optimizer.pt", map_location=device))
@@ -158,17 +240,24 @@ def train_generic(
     color_jitter = T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02)
     affine = T.RandomAffine(degrees=2, translate=(0.03, 0.03))
 
-    progress_bar = tqdm(initial=step, total=train_params.training_steps, desc="Training")
+    disable_tqdm = misc_args.progress_callback is not None
+    progress_bar = tqdm(initial=step, total=train_params.training_steps, desc="Training", disable=disable_tqdm)
+
+    use_amp = device.type in ("cuda", "xpu")
+    amp_dtype = torch.bfloat16 if (device.type == "cuda" and torch.cuda.is_bf16_supported()) else torch.float16
+
+    latest_loss = 0.0
+    latest_val_loss = None
 
     while not done:
         for batch in dataloader:
-            # Move tensors to device
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-            
-            # Populate 'task' for VLA if not present
+            # Populate 'task' for VLA if not present (done on CPU to avoid device-host sync)
             if "task" not in batch and "task_index" in batch:
-                task_indices = batch["task_index"].cpu().numpy()
+                task_indices = batch["task_index"].numpy()
                 batch["task"] = [task_index_to_text.get(int(idx), "Fold the clothes.") for idx in task_indices]
+
+            # Move tensors to device asynchronously
+            batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
             # Apply batch transform callback if provided
             if batch_transform is not None:
@@ -189,10 +278,13 @@ def train_generic(
             batch = preprocessor(batch)
             
             # Forward and backward pass
-            loss, _ = policy.forward(batch)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                loss, _ = policy.forward(batch)
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
+            
+            latest_loss = loss.item()
             
             # Logging and periodic validation
             is_log_step = (step % train_params.log_freq == 0)
@@ -200,8 +292,7 @@ def train_generic(
             is_val_step = (val_dataloader is not None and step % val_freq == 0)
             
             if is_log_step or is_val_step:
-                loss_val = loss.item()
-                postfix = {"loss": f"{loss_val:.5f}"}
+                postfix = {"loss": f"{latest_loss:.5f}"}
                 
                 val_loss_avg = None
                 if is_val_step:
@@ -212,14 +303,14 @@ def train_generic(
                         for val_idx, val_batch in enumerate(val_dataloader):
                             if val_idx >= val_steps:
                                 break
-                            # Move tensors to device
-                            val_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in val_batch.items()}
-                            
-                            # Populate 'task' for VLA
+                            # Populate 'task' for VLA (done on CPU to avoid device-host sync)
                             if "task" not in val_batch and "task_index" in val_batch:
-                                task_indices = val_batch["task_index"].cpu().numpy()
+                                task_indices = val_batch["task_index"].numpy()
                                 val_batch["task"] = [task_index_to_text.get(int(idx), "Fold the clothes.") for idx in task_indices]
 
+                            # Move tensors to device asynchronously
+                            val_batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in val_batch.items()}
+                            
                             # Apply batch transform callback if provided
                             if batch_transform is not None:
                                 val_batch = batch_transform(val_batch)
@@ -228,18 +319,22 @@ def train_generic(
                             val_batch = preprocessor(val_batch)
                             
                             # Forward pass (without augmentation)
-                            val_loss, _ = policy.forward(val_batch)
+                            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                                val_loss, _ = policy.forward(val_batch)
                             val_losses.append(val_loss.item())
                     
                     val_loss_avg = sum(val_losses) / len(val_losses) if val_losses else 0.0
-                    progress_bar.write(f"Step {step}: Validation Loss = {val_loss_avg:.5f}")
+                    latest_val_loss = val_loss_avg
+                    if not disable_tqdm:
+                        progress_bar.write(f"Step {step}: Validation Loss = {val_loss_avg:.5f}")
                     postfix["val_loss"] = f"{val_loss_avg:.5f}"
                     policy.train()
                 
-                progress_bar.set_postfix(**postfix)
+                if not disable_tqdm:
+                    progress_bar.set_postfix(**postfix)
                 
                 # Append to history
-                entry = {"step": step, "loss": loss_val}
+                entry = {"step": step, "loss": latest_loss}
                 if val_loss_avg is not None:
                     entry["val_loss"] = val_loss_avg
                 loss_history.append(entry)
@@ -253,6 +348,15 @@ def train_generic(
                 
             step += 1
             progress_bar.update(1)
+
+            if misc_args.progress_callback is not None:
+                misc_args.progress_callback({
+                    "step": step,
+                    "total_steps": train_params.training_steps,
+                    "loss": latest_loss,
+                    "val_loss": latest_val_loss,
+                    "status": "training",
+                })
             
             # Periodic saving
             if step % train_params.save_freq == 0 or step >= train_params.training_steps:
@@ -273,7 +377,18 @@ def train_generic(
                 if last_link.is_symlink() or last_link.exists():
                     last_link.unlink()
                 last_link.symlink_to(f"{step:06d}")
-                progress_bar.write(f"Saved checkpoint to {checkpoint_dir}")
+                if not disable_tqdm:
+                    progress_bar.write(f"Saved checkpoint to {checkpoint_dir}")
+
+                if misc_args.progress_callback is not None:
+                    misc_args.progress_callback({
+                        "step": step,
+                        "total_steps": train_params.training_steps,
+                        "loss": latest_loss,
+                        "val_loss": latest_val_loss,
+                        "status": "saving",
+                        "checkpoint_dir": str(checkpoint_dir)
+                    })
                 
             if step >= train_params.training_steps:
                 done = True
@@ -289,12 +404,26 @@ def train_dagger(
     dataset: LeRobotDataset,
     current_training_round: int,
     val_dataset: LeRobotDataset | None = None,
-    device: torch.device = None,
-    batch_transform: Callable[[dict], dict] | None = None,
-    optimizer: torch.optim.Optimizer | None = None,
+    misc_args: TrainMiscArgs | None = None,
 ):
+    if misc_args is None:
+        misc_args = TrainMiscArgs()
+
     alpha = getattr(train_params, "dagger_rehearsal_alpha", 0.5) # % of original dataset
     beta = getattr(train_params, "dagger_rehearsal_beta", 0.3) # % of current round expert dataset
+    
+    # Determine starting step from checkpoint or 0
+    output_directory = Path(train_params.output_directory)
+    last_checkpoint_dir = output_directory / "checkpoints" / "last"
+    start_step = 0
+    if (last_checkpoint_dir / "state.json").exists():
+        with open(last_checkpoint_dir / "state.json", "r") as f:
+            state = json.load(f)
+        start_step = state.get("step", 0)
+
+    # Offset training_steps by start_step
+    train_params.training_steps = start_step + train_params.training_steps
+    print(f"Offsetting DAgger training steps: start_step={start_step}, target_steps={train_params.training_steps}")
     
     # Analyze dataset rounds
     hf_dataset = dataset.hf_dataset
@@ -328,7 +457,7 @@ def train_dagger(
     weights = [0.0] * total_frames
     
     if count_N == 0:
-        sampler = None
+        misc_args.sampler = None
     else:
         if current_training_round == 1:
             prob_0 = alpha
@@ -352,6 +481,66 @@ def train_dagger(
             num_samples=train_params.training_steps * train_params.batch_size,
             replacement=True
         )
+        misc_args.sampler = sampler
+
+    train_simple(
+        train_params=train_params,
+        dataset=dataset,
+        val_dataset=val_dataset,
+        policy=policy,
+        cfg=cfg,
+        misc_args=misc_args
+    )
+
+
+def train_simple_act(
+    train_params,
+    dataset: LeRobotDataset,
+    val_dataset: LeRobotDataset | None = None,
+    policy = None,
+    cfg = None,
+    misc_args: TrainMiscArgs | None = None,
+):
+    if misc_args is None:
+        misc_args = TrainMiscArgs()
+
+    if misc_args.device is None:
+        misc_args.device = torch.device("xpu" if torch.xpu.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
+
+    if policy is None:
+        # Determine if resuming or starting from scratch
+        output_directory = Path(train_params.output_directory)
+        last_checkpoint_dir = output_directory / "checkpoints" / "last"
+
+        if (last_checkpoint_dir / "state.json").exists():
+            print(f"Found existing checkpoint at {last_checkpoint_dir.resolve()}. Resuming training...")
+            policy = ACTPolicy.from_pretrained(last_checkpoint_dir)
+            cfg = policy.config
+        else:
+            print("No existing checkpoint found. Starting training from scratch...")
+            # Map dataset features to policy features
+            features = dataset_to_policy_features(dataset.features)
+            output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
+            input_features = {key: ft for key, ft in features.items() if key not in output_features}
+            
+            # Create configuration and policy
+            cfg = ACTConfig(
+                input_features=input_features,
+                output_features=output_features,
+                temporal_ensemble_coeff=0.01,
+                n_action_steps=1,
+            )
+            policy = ACTPolicy(cfg)
+
+    if misc_args.batch_transform is None:
+        def act_batch_transform(batch):
+            # Squeeze the sequence/time dimension (T=1) for all observation tensors,
+            # as ACTPolicy expects 2D states [B, D] and 4D images [B, C, H, W] rather than sequence tensors.
+            for k in list(batch.keys()):
+                if k.startswith("observation.") and isinstance(batch[k], torch.Tensor) and batch[k].ndim == (5 if "images" in k else 3):
+                    batch[k] = batch[k].squeeze(1)
+            return batch
+        misc_args.batch_transform = act_batch_transform
 
     train_generic(
         policy=policy,
@@ -359,88 +548,94 @@ def train_dagger(
         train_params=train_params,
         dataset=dataset,
         val_dataset=val_dataset,
-        device=device,
-        batch_transform=batch_transform,
-        optimizer=optimizer,
-        sampler=sampler
+        misc_args=misc_args,
     )
 
 
-def train_simple_act(train_params, dataset: LeRobotDataset, val_dataset: LeRobotDataset | None = None):
-    # Determine if resuming or starting from scratch
-    output_directory = Path(train_params.output_directory)
-    last_checkpoint_dir = output_directory / "checkpoints" / "last"
-    device = torch.device("xpu" if torch.xpu.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
+def train_simple_smolvla(
+    train_params,
+    dataset: LeRobotDataset,
+    val_dataset: LeRobotDataset | None = None,
+    policy = None,
+    cfg = None,
+    misc_args: TrainMiscArgs | None = None,
+):
+    if misc_args is None:
+        misc_args = TrainMiscArgs()
 
-    if (last_checkpoint_dir / "state.json").exists():
-        print(f"Found existing checkpoint at {last_checkpoint_dir.resolve()}. Resuming training...")
-        policy = ACTPolicy.from_pretrained(last_checkpoint_dir)
-        cfg = policy.config
-    else:
-        print("No existing checkpoint found. Starting training from scratch...")
-        # Map dataset features to policy features
-        features = dataset_to_policy_features(dataset.features)
-        output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
-        input_features = {key: ft for key, ft in features.items() if key not in output_features}
-        
-        # Create configuration and policy
-        cfg = ACTConfig(
-            input_features=input_features,
-            output_features=output_features,
-            temporal_ensemble_coeff=0.01,
-            n_action_steps=1,
+    if misc_args.device is None:
+        misc_args.device = torch.device("xpu" if torch.xpu.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
+
+    if policy is None:
+        # Determine if resuming or starting from scratch
+        output_directory = Path(train_params.output_directory)
+        last_checkpoint_dir = output_directory / "checkpoints" / "last"
+
+        if (last_checkpoint_dir / "state.json").exists():
+            print(f"Found existing checkpoint at {last_checkpoint_dir.resolve()}. Resuming training...")
+            policy = SmolVLAPolicy.from_pretrained(last_checkpoint_dir)
+            cfg = policy.config
+        else:
+            print("No existing checkpoint found. Starting training from scratch...")
+            # Map dataset features to policy features
+            features = dataset_to_policy_features(dataset.features)
+            output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
+            input_features = {key: ft for key, ft in features.items() if key not in output_features}
+            
+            # Create configuration and policy
+            cfg = SmolVLAConfig(
+                input_features=input_features,
+                output_features=output_features,
+            )
+            policy = SmolVLAPolicy(cfg)
+
+    train_generic(
+        policy=policy,
+        cfg=cfg,
+        train_params=train_params,
+        dataset=dataset,
+        val_dataset=val_dataset,
+        misc_args=misc_args,
+    )
+
+
+def train_simple(
+    train_params,
+    dataset: LeRobotDataset,
+    val_dataset: LeRobotDataset | None = None,
+    policy_type: str = "act",
+    policy = None,
+    cfg = None,
+    misc_args: TrainMiscArgs | None = None,
+):
+    if policy is not None:
+        p_name = policy.__class__.__name__.lower()
+        if "act" in p_name:
+            policy_type = "act"
+        elif "smolvla" in p_name:
+            policy_type = "smolvla"
+
+    if hasattr(train_params, "policy_type"):
+        policy_type = train_params.policy_type
+
+    if policy_type == "act":
+        return train_simple_act(
+            train_params=train_params,
+            dataset=dataset,
+            val_dataset=val_dataset,
+            policy=policy,
+            cfg=cfg,
+            misc_args=misc_args,
         )
-        policy = ACTPolicy(cfg)
-
-    def act_batch_transform(batch):
-        # Squeeze the sequence/time dimension (T=1) for all observation tensors,
-        # as ACTPolicy expects 2D states [B, D] and 4D images [B, C, H, W] rather than sequence tensors.
-        for k in list(batch.keys()):
-            if k.startswith("observation.") and isinstance(batch[k], torch.Tensor) and batch[k].ndim == (5 if "images" in k else 3):
-                batch[k] = batch[k].squeeze(1)
-        return batch
-
-    train_generic(
-        policy=policy,
-        cfg=cfg,
-        train_params=train_params,
-        dataset=dataset,
-        val_dataset=val_dataset,
-        device=device,
-        batch_transform=act_batch_transform,
-    )
-
-
-def train_simple_smolvla(train_params, dataset: LeRobotDataset, val_dataset: LeRobotDataset | None = None):
-    # Determine if resuming or starting from scratch
-    output_directory = Path(train_params.output_directory)
-    last_checkpoint_dir = output_directory / "checkpoints" / "last"
-    device = torch.device("xpu" if torch.xpu.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
-
-    if (last_checkpoint_dir / "state.json").exists():
-        print(f"Found existing checkpoint at {last_checkpoint_dir.resolve()}. Resuming training...")
-        policy = SmolVLAPolicy.from_pretrained(last_checkpoint_dir)
-        cfg = policy.config
-    else:
-        print("No existing checkpoint found. Starting training from scratch...")
-        # Map dataset features to policy features
-        features = dataset_to_policy_features(dataset.features)
-        output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
-        input_features = {key: ft for key, ft in features.items() if key not in output_features}
-        
-        # Create configuration and policy
-        cfg = SmolVLAConfig(
-            input_features=input_features,
-            output_features=output_features,
+    elif policy_type == "smolvla":
+        return train_simple_smolvla(
+            train_params=train_params,
+            dataset=dataset,
+            val_dataset=val_dataset,
+            policy=policy,
+            cfg=cfg,
+            misc_args=misc_args,
         )
-        policy = SmolVLAPolicy(cfg)
+    else:
+        raise ValueError(f"Unknown policy type: {policy_type}")
 
-    train_generic(
-        policy=policy,
-        cfg=cfg,
-        train_params=train_params,
-        dataset=dataset,
-        val_dataset=val_dataset,
-        device=device,
-        batch_transform=None,
-    )

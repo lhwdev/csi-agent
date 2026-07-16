@@ -1,48 +1,37 @@
-from studio_core import BaseInteractiveStudio
-
-import torch
+import time
+import asyncio
+from pathlib import Path
+import cv2
+import shutil
+import traceback
 import copy
 from types import SimpleNamespace
-import shutil
-from pathlib import Path
-import asyncio
-import time
-import cv2
-import traceback
 import numpy as np
-import ipywidgets as widgets
+import pandas as pd
+import torch
+
+from lerobot.robots import Robot
+from lerobot.teleoperators import Teleoperator
+from lerobot.datasets import LeRobotDataset
 from lerobot.utils.feature_utils import build_dataset_frame
 from lerobot.utils.constants import ACTION, OBS_STR
-from lerobot.common.control_utils import teleop_supports_feedback
+from lerobot.common.control_utils import (
+    teleop_supports_feedback,
+    teleop_smooth_move_to,
+    follower_smooth_move_to,
+)
+from lerobot.configs.policies import PreTrainedConfig
+from lerobot.rollout.strategies.core import ActionInterpolator
 
 from rollout import create_rollout_context
-from lerobot.rollout.strategies.core import ActionInterpolator
-from lerobot.datasets import LeRobotDataset
+from dagger_train import train_dagger_round
+from studio.core import BaseInteractiveStudio
+from studio.dagger_ui import DAggerUIMixin
 
-# Monkey patch compute_episode_stats to avoid writing stats for intervention and round
-try:
-    import lerobot.datasets.compute_stats
-    import lerobot.datasets.dataset_writer
-    import lerobot.datasets.dataset_tools
+SMOOTH_MOVE_DURATION = 1.0
 
-    # Check if we have already saved the original function to prevent recursion on module reload
-    if not hasattr(lerobot.datasets.compute_stats, "_original_compute_episode_stats"):
-        lerobot.datasets.compute_stats._original_compute_episode_stats = lerobot.datasets.compute_stats.compute_episode_stats
 
-    _orig_compute_episode_stats = lerobot.datasets.compute_stats._original_compute_episode_stats
-
-    def _patched_compute_episode_stats(episode_data, features, quantile_list=None):
-        filtered_episode_data = {k: v for k, v in episode_data.items() if k not in {"intervention", "round"}} if episode_data else episode_data
-        filtered_features = {k: v for k, v in features.items() if k not in {"intervention", "round"}} if features else features
-        return _orig_compute_episode_stats(filtered_episode_data, filtered_features, quantile_list)
-
-    lerobot.datasets.compute_stats.compute_episode_stats = _patched_compute_episode_stats
-    lerobot.datasets.dataset_writer.compute_episode_stats = _patched_compute_episode_stats
-    lerobot.datasets.dataset_tools.compute_episode_stats = _patched_compute_episode_stats
-except Exception as e:
-    print(f"Warning: Failed to monkey patch compute_episode_stats: {e}")
-
-class DAggerInteractiveStudio(BaseInteractiveStudio):
+class DAggerInteractiveStudio(DAggerUIMixin, BaseInteractiveStudio):
     def __init__(self, robot, leader, params):
         self.dagger_phase = "IDLE"
         self.current_training_round = 1
@@ -76,20 +65,6 @@ class DAggerInteractiveStudio(BaseInteractiveStudio):
                 print(f"Cloning {original_root_path} to {new_root_path}")
                 shutil.copytree(original_root_path, new_root_path)
             
-            # Clean up any existing episodes metadata files that might have stats for intervention or round
-            meta_episodes_dir = new_root_path / "meta" / "episodes"
-            if meta_episodes_dir.exists():
-                import pandas as pd
-                for p in meta_episodes_dir.glob("**/*.parquet"):
-                    try:
-                        df = pd.read_parquet(p)
-                        cols_to_drop = [c for c in df.columns if "intervention" in c or "round" in c]
-                        if cols_to_drop:
-                            print(f"Cleaning up metadata file {p}: dropping {cols_to_drop}")
-                            df.drop(columns=cols_to_drop).to_parquet(p)
-                    except Exception as e:
-                        print(f"Warning: failed to clean up {p}: {e}")
-            
             step["repo_id"] = new_repo
             step["root_dir"] = str(new_root_path)
             step["original_root"] = str(original_root_path)
@@ -108,12 +83,32 @@ class DAggerInteractiveStudio(BaseInteractiveStudio):
         return features
 
     def get_online_training_params(self):
+        output_dir = getattr(self.params, "output_dir", None)
+        if output_dir is None:
+            # Try to resolve it from the policy
+            pretrained_path = None
+            if getattr(self.params, "policies", None) and len(self.params.policies) > 0:
+                p_cfg = self.params.policies[0]
+                if hasattr(p_cfg, "pretrained_path"):
+                    pretrained_path = p_cfg.pretrained_path
+            
+            if pretrained_path is not None:
+                p = Path(pretrained_path).resolve()
+                if "checkpoints" in p.parts:
+                    idx = p.parts.index("checkpoints")
+                    original_path = Path(*p.parts[:idx])
+                else:
+                    original_path = p
+                output_dir = str(original_path.parent / f"rollout_hil_{original_path.name}")
+            else:
+                output_dir = "./outputs/dagger_online"
+                
         return {
             "training_steps": getattr(self.params, "dagger_train_steps", 100),
             "batch_size": getattr(self.params, "dagger_train_batch_size", 4),
             "log_freq": 10,
             "save_freq": 100,
-            "output_directory": getattr(self.params, "output_dir", "./outputs/dagger_online"),
+            "output_directory": output_dir,
         }
 
     def load_episode_rounds_cache(self):
@@ -129,7 +124,6 @@ class DAggerInteractiveStudio(BaseInteractiveStudio):
                 episodes = hf_dataset["episode_index"]
                 rounds = hf_dataset["round"] if "round" in hf_dataset.column_names else None
                 
-                import numpy as np
                 ep_arr = np.array(episodes)
                 if rounds is not None:
                     r_arr = np.array(rounds)
@@ -166,6 +160,59 @@ class DAggerInteractiveStudio(BaseInteractiveStudio):
             self.add_log(f"Warning: Failed to load episode rounds cache: {e}")
 
     def on_datasets_initialized(self):
+        # Resolve policy_path
+        policy_path = getattr(self.params, "policy_path", None)
+        if policy_path is None:
+            # Fallback for backward compatibility
+            policies = getattr(self.params, "policies", [])
+            if len(policies) > 0 and hasattr(policies[0], "pretrained_path"):
+                policy_path = str(policies[0].pretrained_path)
+                
+        # Resolve original_path from policy_path
+        original_path = None
+        if policy_path is not None:
+            p = Path(policy_path).resolve()
+            if "checkpoints" in p.parts:
+                idx = p.parts.index("checkpoints")
+                original_path = Path(*p.parts[:idx])
+            else:
+                original_path = p
+                
+        # Resolve dagger_policy_path (acts as output_dir)
+        dagger_policy_path = getattr(self.params, "dagger_policy_path", None)
+        if dagger_policy_path is None:
+            if original_path is not None:
+                dagger_policy_path = str(original_path.parent / f"rollout_hil_{original_path.name}")
+            else:
+                dagger_policy_path = "./outputs/dagger_online"
+                
+        self.params.output_dir = dagger_policy_path
+        self.params.dagger_policy_path = dagger_policy_path
+        self.params.policy_path = policy_path
+        
+        # Determine actual policy loading path: dagger_policy_path if exists and has checkpoints, else policy_path
+        actual_policy_load_path = policy_path
+        if dagger_policy_path is not None:
+            last_chk = Path(dagger_policy_path) / "checkpoints" / "last"
+            if last_chk.exists():
+                actual_policy_load_path = str(last_chk)
+                self.add_log(f"Resuming from online policy: {actual_policy_load_path}")
+            else:
+                if policy_path is not None:
+                    self.add_log(f"Loading original policy: {policy_path}")
+                else:
+                    self.add_log("Warning: No policy path provided to load.")
+                    
+        # Load config and override self.params.policies
+        if actual_policy_load_path is not None:
+            try:
+                policy_cfg = PreTrainedConfig.from_pretrained(actual_policy_load_path, local_files_only=True)
+                policy_cfg.pretrained_path = actual_policy_load_path
+                self.params.policies = [policy_cfg]
+            except Exception as e:
+                self.add_log(f"Error loading policy configuration from {actual_policy_load_path}: {e}")
+                traceback.print_exc()
+
         self.add_log("Preloading policies... This may take a few seconds.")
         policies = getattr(self.params, "policies", [])
         if getattr(self.params, "_rollout_contexts", None) is None:
@@ -193,7 +240,7 @@ class DAggerInteractiveStudio(BaseInteractiveStudio):
         self.next_step_btn.disabled = True
         self.update_navigation_buttons()
         self.recording_state = "IDLE"
-        self.dagger_phase = "AUTONOMOUS" # or IDLE before started
+        self.dagger_phase = "AUTONOMOUS"
         self.current_dataset_step_idx = 0
         
         # Initialize training round from policy config and dataset cache
@@ -202,6 +249,7 @@ class DAggerInteractiveStudio(BaseInteractiveStudio):
             policy_round = getattr(policies[0], "current_training_round", 0)
             
         self.load_episode_rounds_cache()
+        self._initial_episode_idx = self.current_episode_idx
         max_round = 0
         if getattr(self, "episode_rounds_cache", None):
             max_round = max(self.episode_rounds_cache.values())
@@ -211,325 +259,189 @@ class DAggerInteractiveStudio(BaseInteractiveStudio):
             self.round_counter.value = self.current_training_round
         self.add_log(f"Initialized training round to {self.current_training_round} (Policy round: {policy_round}, Max dataset round: {max_round}).")
         
-        self.update_status_card()
-        self.add_log("DAgger studio ready. Start episode to begin AUTONOMOUS mode.")
-
-    def build_controls(self):
-        super().build_controls()
-        # Repurpose standard buttons
-        self.pause_btn.description = "Pause/Resume (P)"
-        self.correction_btn = widgets.Button(description="Correction (C)", icon="edit", button_style="warning", disabled=True)
-        self.train_btn = widgets.Button(description="Train (T)", icon="cogs", button_style="info", disabled=False)
-        self.fps_slider = widgets.IntSlider(value=30, min=1, max=30, step=1, description='Policy FPS:', continuous_update=False)
-        
-        self.round_counter = widgets.IntText(value=getattr(self, "current_training_round", 1), description='Round:', layout=widgets.Layout(width='140px'))
-        def on_round_change(change):
-            self.current_training_round = change['new']
-            self.update_status_card()
-        self.round_counter.observe(on_round_change, names='value')
-        
-        self.start_btn.on_click(self.on_start_clicked)
-        self.pause_btn.on_click(self.on_pause_clicked)
-        self.correction_btn.on_click(self.on_correction_clicked)
-        self.train_btn.on_click(self.on_train_clicked)
-        self.next_step_btn.on_click(self.on_next_step_clicked)
-        self.prev_step_btn.on_click(self.on_prev_step_clicked)
-        self.stop_btn.on_click(self.on_stop_clicked)
-        self.discard_btn.on_click(self.on_discard_clicked)
-
-        self.control_row_1.children = [self.start_btn, self.pause_btn, self.correction_btn, self.prev_step_btn, self.next_step_btn]
-        self.control_row_2.children = [self.stop_btn, self.discard_btn, self.train_btn, self.fps_slider, self.round_counter]
-
-    def build_shortcuts(self):
-        super().build_shortcuts()
-        self.shortcut_legend.value = "<b>Shortcuts:</b> Space/R: Start, P: Pause/Resume, C: Correction, S: Save, D: Discard, T: Train, N: Next Step, B: Prev Step, Q: Exit"
-        def on_shortcut_change(change):
-            key = change['new']
-            if not key: return
-            key = key.lower()
-            self.shortcut_input.value = ""
-            if not self.shortcut_toggle.value: return
-            
-            if key == 'n' and not self.next_step_btn.disabled: self.on_next_step_clicked(None)
-            elif key == 'b' and not self.prev_step_btn.disabled: self.on_prev_step_clicked(None)
-            elif key in (' ', 'space', 'r'):
-                if self.recording_state == "IDLE" and not self.start_btn.disabled: self.on_start_clicked(None)
-                elif self.dagger_phase in ["AUTONOMOUS", "CORRECTING_LOCKED", "CORRECTING_ACTIVE", "PAUSED"] and not self.correction_btn.disabled: 
-                    self.on_correction_clicked(None)
-            elif key == 'p' and not self.pause_btn.disabled: self.on_pause_clicked(None)
-            elif key == 'c' and not self.correction_btn.disabled: self.on_correction_clicked(None)
-            elif key == 's' and not self.stop_btn.disabled: self.on_stop_clicked(None)
-            elif key == 'd' and not self.discard_btn.disabled: self.on_discard_clicked(None)
-            elif key == 't' and not self.train_btn.disabled: self.on_train_clicked(None)
-            elif key == 'q': self.cleanup_studio_sync()
-
-        self.shortcut_input.observe(on_shortcut_change, names='value')
-
-    def update_navigation_buttons(self):
-        if self.datasets and self.recording_state == "IDLE":
-            self.prev_btn.disabled = (self.current_episode_idx == 0)
-            self.next_btn.disabled = (self.current_episode_idx >= self.datasets[0].num_episodes)
-        else:
-            self.prev_btn.disabled = True
-            self.next_btn.disabled = True
-
-    def update_status_card(self):
-        self.update_header()
-        state_class = "status-idle"
-        sub = "Ready to record"
-        if self.recording_state == "RECORDING":
-            state_class = "status-recording"
-            elapsed = self.accumulated_time + (time.perf_counter() - self.episode_start_time)
-            sub = f"[{self.dagger_phase}] Capturing ({self.frames_in_episode} frames, {elapsed:.1f}s)"
-        elif self.recording_state == "SAVING":
-            state_class = "status-saving"
-            sub = "Writing episode to disk..."
-        elif self.recording_state == "TRAINING":
-            state_class = "status-saving"
-            sub = "Training policy..."
-            
-        fps_text = f" | {self.current_fps:.1f} FPS" if getattr(self, 'current_fps', 0) > 0 else ""
-        
-        # Calculate DAgger metrics
-        round_idx = getattr(self, "current_training_round", 1)
-        saved_add_eps = 0
-        eps_in_curr_round = 0
-        if getattr(self, "episode_rounds_cache", None):
-            saved_add_eps = sum(1 for r in self.episode_rounds_cache.values() if r is not None and r > 0)
-            eps_in_curr_round = sum(1 for r in self.episode_rounds_cache.values() if r is not None and r == round_idx)
-            
-        additional_episodes = saved_add_eps
-        if self.recording_state == "RECORDING" and round_idx > 0:
-            additional_episodes += 1
-            
-        ep_in_round = eps_in_curr_round + 1
-        
-        self.status_card.value = f"""
-        <div class="status-card {state_class}">
-            <div class="status-text">{self.recording_state} - {self.dagger_phase if self.recording_state == 'RECORDING' else ''}</div>
-            <div style="font-size: 14px; font-weight: 700; margin-top: 5px; opacity: 0.95;">Episode:
-            {self.current_episode_idx} (Step: {self.current_dataset_step_idx + 1}/{len(self.steps_val)}){fps_text} | Rnd: {round_idx} | Add. Eps: {additional_episodes} |
-            Ep/Rnd: {ep_in_round}</div>
-            <div style="font-size: 12px; margin-top: 3px; opacity: 0.8;">{sub}</div>
-        </div>
-        """
+        # Build and append the Training tab panel
+        self.build_training_panel()
+        self.update_training_info()
 
     async def start_recording_async(self):
         if self.recording_state != "IDLE": return
         
-        if not hasattr(self, "initial_robot_action"):
-            if getattr(self, "current_robot_action", None) is not None:
-                import copy
-                self.initial_robot_action = copy.deepcopy(self.current_robot_action)
-                self.add_log("Recorded initial posture for return.")
-            else:
-                self.add_log("Warning: Could not record initial posture, no action available yet.")
-                
         self.recording_state = "RECORDING"
         self.dagger_phase = "AUTONOMOUS"
-        self.current_dataset_step_idx = 0
-        self.episode_start_time = time.perf_counter()
-        self.accumulated_time = 0.0
         self.frames_in_episode = 0
+        setattr(self.params, "_needs_reset", True)
         
         self.start_btn.disabled = True
         self.pause_btn.disabled = False
         self.correction_btn.disabled = False
         self.prev_step_btn.disabled = True
-        self.next_step_btn.disabled = (len(self.steps_val) <= 1)
+        self.next_step_btn.disabled = True
         self.stop_btn.disabled = False
         self.discard_btn.disabled = False
         self.train_btn.disabled = True
-        self.update_navigation_buttons()
         
-        self.add_log(f"Recording episode {self.current_episode_idx}... AUTONOMOUS mode.")
-        setattr(self.params, "_needs_reset", True)
+        self.add_log(f"Started HIL Rollout for round {self.current_training_round}...")
         self.update_status_card()
 
     def on_start_clicked(self, b):
         self.active_bg_task = self.schedule_background_task(self.start_recording_async())
 
-    def update_telemetry(self, obs, raw_action, current_fps, policy_action=None):
-        teleop_action = self.teleop_action_processor((raw_action, obs))
-        # If in autonomous mode, we plot the policy action instead of human teleop action
-        if self.dagger_phase == "AUTONOMOUS" and policy_action is not None:
-            robot_action = policy_action
-        else:
-            robot_action = self.robot_action_processor((teleop_action, obs))
-            
-        text = f"<b>DAGGER TELEMETRY</b><br/>"
-        text += f"Loop frequency: {current_fps:.1f} Hz<br/>"
-        text += f"Phase: {self.dagger_phase}<br/>"
-        self.telemetry_widget.value = f'<div class="telemetry-card">{text}</div>'
-        
-        if self.dagger_phase == "AUTONOMOUS":
-            now = time.perf_counter()
-            if not hasattr(self, "_last_plot_time"):
-                self._last_plot_time = 0.0
-            target_interval = 1.0 / self.autonomous_plot_fps if self.autonomous_plot_fps > 0 else float('inf')
-            if now - self._last_plot_time < target_interval:
-                return
-            self._last_plot_time = now
-            
-        if not getattr(self, "plotter_is_updating", False):
-            self.plotter_is_updating = True
-            def run_plot():
-                return self.plotter.update(obs, robot_action)
-                
-            async def run_plot_async():
-                try:
-                    chart_bytes = await asyncio.to_thread(run_plot)
-                    if chart_bytes:
-                        self.charts_holder_widget.value = chart_bytes
-                except Exception as e:
-                    print(f"Plotter error: {e}")
-                finally:
-                    self.plotter_is_updating = False
-                    
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(run_plot_async())
-            except RuntimeError:
-                self.plotter_is_updating = False
-
     def on_pause_clicked(self, b):
-        if self.recording_state != "RECORDING": return
-        if self.dagger_phase == "AUTONOMOUS":
-            self.dagger_phase = "PAUSED"
-            self.add_log("Policy PAUSED. Robot holds position.")
-            self.correction_btn.disabled = False
-            self.update_status_card()
-        elif self.dagger_phase == "PAUSED":
-            self.dagger_phase = "AUTONOMOUS"
-            self.add_log("Resuming AUTONOMOUS mode.")
-            self.correction_btn.disabled = False
-            setattr(self.params, "_needs_reset", True)
-            self.update_status_card()
-        elif self.dagger_phase == "CORRECTING":
-            self.add_log("You must finish correction using Correction button.")
+        if self.recording_state == "RECORDING":
+            self.recording_state = "PAUSED"
+            self.add_log("HIL execution paused. Motors locked.")
+        elif self.recording_state == "PAUSED":
+            self.recording_state = "RECORDING"
+            self.add_log("HIL execution resumed.")
+        self.update_status_card()
+
+    def enable_leader_torque(self):
+        try:
+            self.leader.enable_torque()
+        except Exception as e:
+            self.add_log(f"Warning: Failed to enable leader torque: {e}")
+
+    def disable_leader_torque(self):
+        try:
+            self.leader.disable_torque()
+        except Exception as e:
+            self.add_log(f"Warning: Failed to disable leader torque: {e}")
+
+    def smooth_move_leader_to(self, target_pos: dict, duration_s: float = SMOOTH_MOVE_DURATION):
+        try:
+            self.add_log(f"Moving leader to target in {duration_s}s...")
+            self.enable_leader_torque()
+            teleop_smooth_move_to(self.leader, target_pos, duration_s)
+            self.add_log("Leader alignment completed.")
+        except Exception as e:
+            self.add_log(f"Warning: smooth leader move failed: {e}")
+
+    async def smooth_move_follower_to_async(self, target_action: dict, duration_s: float = SMOOTH_MOVE_DURATION):
+        try:
+            self.add_log(f"Smoothing follower movement to target ({duration_s}s)...")
+            current_action = getattr(self, "current_robot_action", None)
+            if current_action is None:
+                current_action = {}
+                obs = await asyncio.to_thread(self.robot.get_observation)
+                for k in target_action.keys():
+                    if k in obs:
+                        current_action[k] = obs[k]
+                    else:
+                        current_action[k] = target_action[k]
+            async with self.robot_lock:
+                await asyncio.to_thread(follower_smooth_move_to, self.robot, current_action, target_action, duration_s)
+            self.add_log("Follower alignment completed.")
+        except Exception as e:
+            self.add_log(f"Warning: smooth follower move failed: {e}")
+
+    async def _move_leader_to_follower_state_async(self):
+        """Smoothly move leader to current follower (inference) state when entering CORRECTING_LOCKED."""
+        try:
+            async with self.robot_lock:
+                obs = await asyncio.to_thread(self.robot.get_observation)
+            target_dict = {k: v for k, v in obs.items() if k.endswith(".pos")}
+            if target_dict:
+                await asyncio.to_thread(self.smooth_move_leader_to, target_dict)
+                self.add_log("Leader aligned to follower state. Ready for correction.")
+            else:
+                self.add_log("Warning: No joint positions found in observation for leader alignment.")
+        except Exception as e:
+            self.add_log(f"Warning: Failed to move leader to follower state: {e}")
 
     def on_correction_clicked(self, b):
-        if self.dagger_phase in ["AUTONOMOUS", "PAUSED"]:
-            prev_phase = self.dagger_phase
-            self.dagger_phase = "CORRECTING_LOCKED"
-            self.recording_state = "PAUSED"
-            if hasattr(self.leader, "enable_torque"): self.leader.enable_torque()
-            
-            if prev_phase == "AUTONOMOUS":
-                if hasattr(self, "last_obs") and self.last_obs is not None and hasattr(self.leader, "send_feedback"):
-                    self.schedule_background_task(asyncio.to_thread(self.leader.send_feedback, self.last_obs))
-                self.add_log("Correction Phase 1: Leader locked to follower position.")
-            else:
-                self.add_log("Correction Phase 1: Leader locked.")
-            
-        elif self.dagger_phase == "CORRECTING_LOCKED":
-            self.dagger_phase = "CORRECTING_ACTIVE"
-            if hasattr(self.leader, "disable_torque"): self.leader.disable_torque()
-            self.recording_state = "RECORDING"
-            self.add_log("Correction Phase 2: Follower following leader. Recording resumed.")
-            
-        elif self.dagger_phase == "CORRECTING_ACTIVE":
-            self.dagger_phase = "AUTONOMOUS"
-            self.add_log("Correction ended. Resuming policy rollout.")
-            
-        self.update_status_card()
+        if self.recording_state == "RECORDING":
+            if self.dagger_phase == "AUTONOMOUS":
+                self.dagger_phase = "CORRECTING_LOCKED"
+                self.correction_btn.description = "Engage (C)"
+                self.correction_btn.button_style = "danger"
+                self.add_log("Intervention triggered! Follower frozen. Moving leader to follower state...")
+                # Smoothly move leader to current follower (inference) state
+                self.active_bg_task = self.schedule_background_task(
+                    self._move_leader_to_follower_state_async()
+                )
+            elif self.dagger_phase == "CORRECTING_LOCKED":
+                self.dagger_phase = "CORRECTING_ACTIVE"
+                self.correction_btn.description = "Correction (C)"
+                self.correction_btn.button_style = "warning"
+                self.disable_leader_torque()
+                self.add_log("Engaged! Human correction active. Leader controls follower.")
+            elif self.dagger_phase == "CORRECTING_ACTIVE":
+                self.dagger_phase = "AUTONOMOUS"
+                self.correction_btn.description = "Correction (C)"
+                self.correction_btn.button_style = "warning"
+                self.disable_leader_torque()
+                setattr(self.params, "_needs_reset", True)
+                self.add_log("Switched back to AUTONOMOUS control mode.")
+        elif self.recording_state == "PAUSED":
+            self.add_log("Cannot intervene while paused.")
 
     def on_next_step_clicked(self, b):
-        if self.recording_state == "RECORDING" and self.current_dataset_step_idx < len(self.steps_val) - 1:
-            self.current_dataset_step_idx += 1
-            self.frames_in_episode = 0
-            if self.current_dataset_step_idx == len(self.steps_val) - 1:
-                self.next_step_btn.disabled = True
-            self.prev_step_btn.disabled = False
-            setattr(self.params, "_needs_reset", True)
-            self.update_status_card()
+        pass
 
     def on_prev_step_clicked(self, b):
-        if self.recording_state == "RECORDING" and self.current_dataset_step_idx > 0:
-            self.current_dataset_step_idx -= 1
-            self.frames_in_episode = 0
-            if self.current_dataset_step_idx == 0:
-                self.prev_step_btn.disabled = True
-            self.next_step_btn.disabled = False
-            setattr(self.params, "_needs_reset", True)
-            self.update_status_card()
+        pass
 
     async def return_to_initial_posture_async(self):
-        if not hasattr(self, "initial_robot_action") or self.initial_robot_action is None:
-            return
-            
-        self.recording_state = "IDLE"
+        self.add_log("Aligning teleoperator for autonomous return...")
         self.dagger_phase = "RETURNING"
-        self.update_status_card()
         
-        self.add_log("Returning to initial posture...")
+        # Read current follower observation
+        async with self.robot_lock:
+            obs = await asyncio.to_thread(self.robot.get_observation)
         
-        from lerobot.common.control_utils import teleop_supports_feedback, teleop_smooth_move_to, follower_smooth_move_to
-        
-        target_action = self.initial_robot_action
-        current_action = getattr(self, "current_robot_action", None)
-        if current_action is None:
-            current_action = target_action
-            
-        tasks = []
-        tasks.append(asyncio.to_thread(
-            follower_smooth_move_to, self.robot, current_action, target_action, 2.0, 30
-        ))
-        
-        if teleop_supports_feedback(self.leader):
-            tasks.append(asyncio.to_thread(
-                teleop_smooth_move_to, self.leader, target_action, 2.0, 30
-            ))
-            
-        if tasks:
-            try:
-                await asyncio.gather(*tasks)
-            except Exception as e:
-                self.add_log(f"Warning: return to posture failed: {e}")
-                import traceback
-                traceback.print_exc()
-            
-        self.add_log("Return complete. Unlocking leader...")
-        if hasattr(self.leader, "disable_torque"):
-            try:
-                self.leader.disable_torque()
-            except Exception:
-                pass
+        # Prepare target posture from start of current round/dataset if possible
+        target_dict = {}
+        for k in obs.keys():
+            if k.endswith(".pos"):
+                # Align leader directly with current follower pose to allow smooth handoff
+                target_dict[k] = obs[k]
+                
+        if target_dict:
+            await asyncio.gather(
+                asyncio.to_thread(self.smooth_move_leader_to, target_dict),
+                self.smooth_move_follower_to_async(target_dict)
+            )
+            self.disable_leader_torque()
 
     async def save_current_episode_async(self):
         if self.recording_state == "SAVING": return
         self.recording_state = "SAVING"
         self.update_status_card()
         
+        self.start_btn.disabled = True
+        self.pause_btn.disabled = True
+        self.correction_btn.disabled = True
+        self.stop_btn.disabled = True
+        self.discard_btn.disabled = True
+        self.train_btn.disabled = True
+        
+        self.add_log(f"Finalizing episode {self.current_episode_idx}...")
         try:
-            for ds in self.datasets:
-                await asyncio.to_thread(ds.save_episode)
+            if self.frames_in_episode > 0:
+                # Save episode
+                for ds in self.datasets:
+                    await asyncio.to_thread(ds.save_episode)
+                    await asyncio.to_thread(self.flush_dataset, ds)
+                    
+                # Update round cache
+                self.episode_rounds_cache[self.current_episode_idx] = self.current_training_round
+                self.current_episode_idx += 1
+                self.episode_progress.value = self.current_episode_idx
                 
-                def flush_ds(ds):
-                    if hasattr(ds, "writer") and ds.writer is not None:
-                        w = ds.writer
-                        if hasattr(w, "close_writer"):
-                            w.close_writer()
-                        if hasattr(w, "_meta") and hasattr(w._meta, "_close_writer"):
-                            w._meta._close_writer()
-                        if hasattr(w, "_latest_episode") and w._latest_episode is not None:
-                            from lerobot.datasets.utils import update_chunk_file_indices
-                            c, f = w._latest_episode["data/chunk_index"], w._latest_episode["data/file_index"]
-                            c, f = update_chunk_file_indices(c, f, w._meta.chunks_size)
-                            w._latest_episode["data/chunk_index"] = c
-                            w._latest_episode["data/file_index"] = f
-                            w._current_file_start_frame = w._latest_episode["index"][-1] + 1
-                            
-                await asyncio.to_thread(flush_ds, ds)
+                # Update newest round frames cache
+                round_idx = self.current_training_round
+                if not hasattr(self, "_newest_round_frames_cache"):
+                    self._newest_round_frames_cache = {}
+                self._newest_round_frames_cache[round_idx] = self._newest_round_frames_cache.get(round_idx, 0) + getattr(self, "frames_in_episode", 0)
                 
-            self.current_episode_idx += 1
-            self.episode_progress.value = self.current_episode_idx
-                
-            self.load_episode_rounds_cache()
-            self.add_log(f"Episode {self.current_episode_idx - 1} saved successfully.")
+                self.update_training_info()
+                self.add_log(f"Episode {self.current_episode_idx - 1} saved successfully.")
+            else:
+                self.add_log("Episode has 0 frames. Discarding instead of saving.")
+                for ds in self.datasets:
+                    await asyncio.to_thread(ds.clear_episode_buffer, delete_images=True)
         except Exception as e:
             self.add_log(f"Error saving episode: {e}")
-            import traceback
             traceback.print_exc()
         finally:
             try:
@@ -540,13 +452,13 @@ class DAggerInteractiveStudio(BaseInteractiveStudio):
             self.dagger_phase = "AUTONOMOUS"
             self.current_dataset_step_idx = 0
             self.update_status_card()
+            
             self.start_btn.disabled = False
             self.pause_btn.disabled = True
             self.correction_btn.disabled = True
             self.stop_btn.disabled = True
             self.discard_btn.disabled = True
             self.train_btn.disabled = False
-            self.update_navigation_buttons()
 
     def on_train_clicked(self, b):
         self.active_bg_task = self.schedule_background_task(self.train_model_async())
@@ -563,11 +475,18 @@ class DAggerInteractiveStudio(BaseInteractiveStudio):
         self.train_btn.disabled = True
         self.add_log("Starting online training...")
 
+        # Auto Tab Switching
+        self.prev_tab_index = self.studio_tab.selected_index
+        self.studio_tab.selected_index = self.training_tab_index
+        self.train_status_widget.value = "<div class='train-status' style='font-size: 11px; color: #495057; font-family: monospace; border-top: 1px solid #dee2e6; margin-top: 4px; padding-top: 4px;'>Status: Starting...</div>"
+
         try:
-            # Prepare arguments for train_generic
-            train_params = SimpleNamespace(**self.get_online_training_params())
-            
-            from train import train_dagger
+            # Refresh dataset reader so it contains all newly saved episodes
+            for ds in self.datasets:
+                if hasattr(ds, "reader") and ds.reader is not None:
+                    self.add_log("Refreshing dataset reader...")
+                    await asyncio.to_thread(ds.reader.load_and_activate)
+
             # Train the first policy for now, assuming 1 policy setup
             if getattr(self.params, "_rollout_contexts", None) and 0 in self.params._rollout_contexts:
                 ctx = self.params._rollout_contexts[0]
@@ -583,96 +502,30 @@ class DAggerInteractiveStudio(BaseInteractiveStudio):
                 # Fetch dataset
                 ds = self.datasets[0]
                 
-                # Extract episodes that have round > 0 (new corrections) to force them into training set
-                hf_dataset = ds.hf_dataset
-                force_train_episodes = set()
-                if "round" in hf_dataset.column_names and "episode_index" in hf_dataset.column_names:
-                    rounds = hf_dataset["round"]
-                    episode_indices = hf_dataset["episode_index"]
-                    for r, ep in zip(rounds, episode_indices):
-                        if r is None:
-                            continue
-                        r_val = r[0] if (isinstance(r, list) or isinstance(r, tuple)) else r
-                        if r_val is None:
-                            continue
-                        r_val = int(r_val)
-                        if r_val > 0:
-                            if ep is None:
-                                continue
-                            ep_val = ep[0] if (isinstance(ep, list) or isinstance(ep, tuple)) else ep
-                            if ep_val is None:
-                                continue
-                            ep_val = int(ep_val)
-                            force_train_episodes.add(ep_val)
-                            
-                # Split dataset
-                from split_dataset import split_dataset
-                train_ds, val_ds = split_dataset(ds, val_ratio=0.1, seed=28, force_train_episodes=force_train_episodes)
-                
-                # Dynamic training steps based on new frames
-                beta = getattr(train_params, "dagger_rehearsal_beta", 0.3)
-                new_epochs = getattr(self.params, "dagger_train_new_epochs", 3.0)
-                
-                hf_dataset = train_ds.hf_dataset
-                newest_round_frames = 0
-                if "round" in hf_dataset.column_names:
-                    rounds = hf_dataset["round"]
-                    current_training_round = getattr(self, "current_training_round", 1)
-                    
-                    for r in rounds:
-                        if r is None:
-                            continue
-                        val = r[0] if (isinstance(r, list) or isinstance(r, tuple)) else r
-                        if val is None:
-                            continue
-                        if int(val) == current_training_round:
-                            newest_round_frames += 1
+                # Prepare arguments for train_generic
+                train_params = SimpleNamespace(**self.get_online_training_params())
+                train_params.dagger_rehearsal_beta = getattr(self.params, "dagger_rehearsal_beta", 0.3)
+                train_params.dagger_rehearsal_alpha = getattr(self.params, "dagger_rehearsal_alpha", 0.5)
 
-                if newest_round_frames > 0:
-                    computed_steps = int(((new_epochs * newest_round_frames) / beta) / train_params.batch_size)
-                    train_params.training_steps = max(getattr(self.params, "dagger_train_steps", 100), computed_steps)
-                    self.add_log(f"Dynamic steps: {train_params.training_steps} for {newest_round_frames} new frames in train set.")
-                else:
-                    self.add_log(f"No new frames in round {getattr(self, 'current_training_round', 1)} in train set. Using default steps.")
+                pretrained_path = None
+                if getattr(self.params, "policies", None) and len(self.params.policies) > 0:
+                    p_cfg = self.params.policies[0]
+                    if hasattr(p_cfg, "pretrained_path"):
+                        pretrained_path = p_cfg.pretrained_path
 
-                # Retrieve optimizer if cached, or let train_generic create it
-                if not hasattr(self, "optimizer_cache"):
-                    self.optimizer_cache = None
-                    
-                def act_batch_transform(batch):
-                    import torch
-                    for k in list(batch.keys()):
-                        if k.startswith("observation.") and isinstance(batch[k], torch.Tensor) and batch[k].ndim == (5 if "images" in k else 3):
-                            batch[k] = batch[k].squeeze(1)
-                    return batch
-                    
                 def run_training():
-                    nonlocal policy
-                    cfg = policy.config
-                    
-                    batch_transform = None
-                    if policy.__class__.__name__ == "ACTPolicy":
-                        batch_transform = act_batch_transform
-                        
-                    # Set current training round inside policy config so it is saved in config.json
-                    policy.config.current_training_round = getattr(self, "current_training_round", 1)
-                    
-                    # Train single model synchronously in thread
-                    train_dagger(
-                        policy=policy,
-                        cfg=cfg,
+                    train_dagger_round(
                         train_params=train_params,
-                        dataset=train_ds,
+                        dataset=ds,
                         current_training_round=getattr(self, "current_training_round", 1),
-                        val_dataset=val_ds,
+                        new_epochs=self.epochs_slider.value,
+                        pretrained_path=pretrained_path,
+                        policy=policy,
+                        cfg=policy.config,
                         device=device,
-                        batch_transform=batch_transform,
-                        optimizer=self.optimizer_cache,
+                        progress_callback=self.on_train_progress,
+                        optimizer_cache=self.optimizer_cache,
                     )
-                    # We might want to save the optimizer cache here, but AdamW objects modify states in-place.
-                    # Actually, we need to extract the optimizer from train_generic. Since we don't return it,
-                    # we can create it here and pass it, or just let train_generic recreate it (slower convergence).
-                    # For simplicity, we just pass None for now. It will resume from the checkpoint if possible.
                     
                 await asyncio.to_thread(run_training)
                 self.add_log("Training completed successfully.")
@@ -680,8 +533,8 @@ class DAggerInteractiveStudio(BaseInteractiveStudio):
                 current_round = getattr(self, "current_training_round", 0) + 1
                 self.current_training_round = current_round
                 if hasattr(self, "round_counter"):
-                    # Temporarily unobserve to avoid double-update
                     self.round_counter.value = self.current_training_round
+                self.update_training_info()
                 self.add_log(f"Training round {current_round} completed. Datasets are aggregated.")
 
                 # Restart inference engine
@@ -695,9 +548,18 @@ class DAggerInteractiveStudio(BaseInteractiveStudio):
             self.add_log(f"Training failed: {e}")
             traceback.print_exc()
         finally:
+            if hasattr(self, "_newest_round_frames_cache"):
+                self._newest_round_frames_cache.clear()
             self.recording_state = "IDLE"
             self.dagger_phase = "AUTONOMOUS"
             self.update_status_card()
+
+            # Switch focus back
+            if hasattr(self, "prev_tab_index") and self.prev_tab_index is not None:
+                self.studio_tab.selected_index = self.prev_tab_index
+
+            self.train_status_widget.value = "<div class='train-status' style='font-size: 11px; color: #495057; font-family: monospace; border-top: 1px solid #dee2e6; margin-top: 4px; padding-top: 4px;'>Status: Completed</div>"
+
             self.start_btn.disabled = False
             self.train_btn.disabled = False
 
@@ -709,6 +571,7 @@ class DAggerInteractiveStudio(BaseInteractiveStudio):
         self.recording_state = "SAVING"
         self.update_status_card()
         
+        self.add_log("Discarding current episode buffer...")
         try:
             for ds in self.datasets:
                 await asyncio.to_thread(ds.clear_episode_buffer, delete_images=True)
@@ -720,22 +583,24 @@ class DAggerInteractiveStudio(BaseInteractiveStudio):
                 await self.return_to_initial_posture_async()
             except Exception as e:
                 self.add_log(f"Error in return_to_initial_posture_async: {e}")
+            self.recording_state = "IDLE"
+            self.dagger_phase = "AUTONOMOUS"
+            self.current_dataset_step_idx = 0
+            self.update_status_card()
+            
             self.start_btn.disabled = False
             self.pause_btn.disabled = True
             self.correction_btn.disabled = True
             self.stop_btn.disabled = True
             self.discard_btn.disabled = True
             self.train_btn.disabled = False
-            self.recording_state = "IDLE"
-            self.dagger_phase = "AUTONOMOUS"
-            self.update_status_card()
-            self.update_navigation_buttons()
 
     def on_discard_clicked(self, b):
         self.active_bg_task = self.schedule_background_task(self.on_discard_clicked_async())
 
     async def main_loop(self):
-        robot_lock = asyncio.Lock()
+        self.robot_lock = asyncio.Lock()
+        robot_lock = self.robot_lock
         loop_fps = 30.0
         last_widget_update_time = 0.0
         last_telemetry_update_time = 0.0
@@ -768,16 +633,21 @@ class DAggerInteractiveStudio(BaseInteractiveStudio):
             last_sent_action = None
 
             while self.keep_running:
+                if self.recording_state == "TRAINING":
+                    await asyncio.sleep(0.1)
+                    continue
                 start_loop = time.perf_counter()
                 try:
-                    if self.dagger_phase == "AUTONOMOUS" and self.recording_state != "IDLE":
-                        # During autonomous rollout, do not read leader joints.
-                        # This saves USB reading latency and serial bus overhead.
+                    if (self.dagger_phase == "AUTONOMOUS" and self.recording_state != "IDLE") or self.dagger_phase in ["CORRECTING_LOCKED", "RETURNING"]:
                         new_raw_action = raw_action
                         new_teleop_action = teleop_action
                     else:
-                        new_raw_action = await asyncio.to_thread(self.leader.get_action)
-                        new_teleop_action = self.teleop_action_processor((new_raw_action, obs))
+                        try:
+                            new_raw_action = await asyncio.to_thread(self.leader.get_action)
+                            new_teleop_action = self.teleop_action_processor((new_raw_action, obs))
+                        except ConnectionError:
+                            new_raw_action = raw_action
+                            new_teleop_action = teleop_action
                     
                     self.last_obs = obs
 
@@ -788,10 +658,9 @@ class DAggerInteractiveStudio(BaseInteractiveStudio):
                         new_robot_action = self.robot_action_processor((new_teleop_action, obs))
                         self.current_teleop_action = new_teleop_action
                     elif self.dagger_phase == "CORRECTING_LOCKED" or self.recording_state in ["PAUSED", "TRAINING", "SAVING"]:
-                        new_robot_action = last_sent_action # frozen
+                        new_robot_action = last_sent_action
                         self.current_teleop_action = new_teleop_action
                     elif self.dagger_phase == "AUTONOMOUS":
-                        # Use policy action
                         policies = getattr(self.params, "policies", [])
                         if self.current_dataset_step_idx < len(policies):
                             policy_cfg = policies[self.current_dataset_step_idx]
@@ -833,9 +702,9 @@ class DAggerInteractiveStudio(BaseInteractiveStudio):
                                         ordered_keys = ctx.data.ordered_action_keys
                                         action_dict = {k: interp[i].item() for i, k in enumerate(ordered_keys)}
                                         new_robot_action = self.robot_action_processor((action_dict, obs))
-                                        self.current_teleop_action = action_dict # Plot and save policy action
+                                        self.current_teleop_action = action_dict
                                     else:
-                                        new_robot_action = last_sent_action # fallback
+                                        new_robot_action = last_sent_action
                                         self.current_teleop_action = new_teleop_action
                             else:
                                 new_robot_action = last_sent_action
@@ -855,7 +724,6 @@ class DAggerInteractiveStudio(BaseInteractiveStudio):
                     teleop_action = new_teleop_action
                     robot_action = new_robot_action
 
-                    # Throttling to reduce lag if not in teleop
                     target_fps = 30.0 if self.dagger_phase in ["CORRECTING_ACTIVE", "IDLE"] else float(self.fps_slider.value)
                     actual_dt = time.perf_counter() - start_loop
                     sleep_time = max(0.0001, (1.0 / target_fps) - actual_dt)
@@ -867,11 +735,13 @@ class DAggerInteractiveStudio(BaseInteractiveStudio):
                     self.add_log(f"teleop loop error: {e}")
                     traceback.print_exc()
                     await asyncio.sleep(0.01)
-                    continue
 
         async def observation_loop():
             nonlocal obs, obs_processed, last_widget_update_time, last_telemetry_update_time
             while self.keep_running:
+                if self.recording_state == "TRAINING":
+                    await asyncio.sleep(0.1)
+                    continue
                 start_loop = time.perf_counter()
                 try:
                     async with robot_lock:
@@ -885,8 +755,6 @@ class DAggerInteractiveStudio(BaseInteractiveStudio):
                 self.streamer.update_telemetry(obs, raw_action)
 
                 if self.recording_state == "RECORDING":
-                    # Record during AUTONOMOUS and CORRECTING
-                    # PAUSED does not record
                     if self.dagger_phase in ["AUTONOMOUS", "CORRECTING", "CORRECTING_ACTIVE"]:
                         if self.datasets and self.current_dataset_step_idx < len(self.datasets):
                             ds = self.datasets[self.current_dataset_step_idx]
@@ -902,22 +770,18 @@ class DAggerInteractiveStudio(BaseInteractiveStudio):
                                     if "round" not in ds.writer.episode_buffer:
                                         ds.writer.episode_buffer["round"] = []
 
-                            # Resize images in obs_processed if they don't match dataset features
                             for key, feat in ds.features.items():
                                 if key.startswith(f"{OBS_STR}.images."):
                                     cam_key = key.replace(f"{OBS_STR}.images.", "")
                                     if cam_key in obs_processed:
                                         img = obs_processed[cam_key]
                                         expected_shape = feat["shape"]
-                                        # expected_shape might be (H, W, C) or (C, H, W)
-                                        # we assume img is (H, W, C)
                                         target_h, target_w = (expected_shape[0], expected_shape[1]) if expected_shape[-1] == 3 else (expected_shape[1], expected_shape[2])
                                         if img.shape[:2] != (target_h, target_w):
                                             obs_processed[cam_key] = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_AREA)
 
                             observation_frame = build_dataset_frame(ds.features, obs_processed, prefix=OBS_STR)
                             
-                            # Determine correct action frame and intervention flag
                             intervention = False
                             if self.dagger_phase == "CORRECTING_ACTIVE":
                                 action_frame = build_dataset_frame(ds.features, getattr(self, "current_teleop_action", teleop_action), prefix=ACTION)
@@ -934,7 +798,6 @@ class DAggerInteractiveStudio(BaseInteractiveStudio):
                                 "intervention": np.array([intervention], dtype=bool),
                                 "round": np.array([getattr(self, "current_training_round", 0)], dtype=np.int32)
                             }
-                            # Add frame if we have valid action
                             if action_frame and len(action_frame) > 0:
                                 record_this_frame = True
                                 if getattr(self, "record_corrections_only", False):
@@ -985,8 +848,6 @@ class DAggerInteractiveStudio(BaseInteractiveStudio):
         finally:
             self.cleanup_studio_sync()
 
+
 def rollout_interactive_dagger(robot, leader, params):
-    """
-    Interactive recording studio GUI (Rollout & DAgger Mode).
-    """
     DAggerInteractiveStudio(robot, leader, params)

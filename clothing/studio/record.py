@@ -1,31 +1,23 @@
-# ========================================== 
-# LeRobot Interactive Recording Studio GUI
-# ========================================== 
-
 import time
 import asyncio
 from pathlib import Path
 import cv2
 import ipywidgets as widgets
-from IPython.display import display
-import datasets
-datasets.disable_progress_bar()
-
 import shutil
 import tempfile
 import traceback
 from types import SimpleNamespace
-from IPython import get_ipython
+import numpy as np
 
 # LeRobot imports
 from lerobot.robots import Robot
 from lerobot.teleoperators import Teleoperator
-from lerobot.datasets import LeRobotDataset, aggregate_pipeline_dataset_features, create_initial_features, delete_episodes
-from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dicts
+from lerobot.datasets import LeRobotDataset, delete_episodes
+from lerobot.utils.feature_utils import build_dataset_frame
 from lerobot.utils.constants import ACTION, OBS_STR
-from lerobot.processor import make_default_processors
 
-from clothing.studio_core import BaseInteractiveStudio
+from studio.core import BaseInteractiveStudio
+
 
 class RecordInteractiveStudio(BaseInteractiveStudio):
     def on_datasets_initialized(self):
@@ -355,23 +347,7 @@ class RecordInteractiveStudio(BaseInteractiveStudio):
         try:
             for idx, ds in enumerate(self.datasets):
                 await asyncio.to_thread(ds.save_episode)
-                
-                def flush_ds(ds):
-                    if hasattr(ds, "writer") and ds.writer is not None:
-                        w = ds.writer
-                        if hasattr(w, "close_writer"):
-                            w.close_writer()
-                        if hasattr(w, "_meta") and hasattr(w._meta, "_close_writer"):
-                            w._meta._close_writer()
-                        if hasattr(w, "_latest_episode") and w._latest_episode is not None:
-                            from lerobot.datasets.utils import update_chunk_file_indices
-                            c, f = w._latest_episode["data/chunk_index"], w._latest_episode["data/file_index"]
-                            c, f = update_chunk_file_indices(c, f, w._meta.chunks_size)
-                            w._latest_episode["data/chunk_index"] = c
-                            w._latest_episode["data/file_index"] = f
-                            w._current_file_start_frame = w._latest_episode["index"][-1] + 1
-                            
-                await asyncio.to_thread(flush_ds, ds)
+                await asyncio.to_thread(self.flush_dataset, ds)
                 
             self.add_log(f"Episode {self.current_episode_idx} saved on disk for all steps.")
             
@@ -550,6 +526,7 @@ class RecordInteractiveStudio(BaseInteractiveStudio):
                     ui_fps_target = self.fps_control.value if getattr(self, 'fps_control', None) else 15
                 should_update_widgets = (now - last_widget_update_time >= (1.0 / max(1, ui_fps_target)))
                 
+                # Update cameras
                 encoding_tasks = []
                 for key, widget in [("left_cam", self.left_camera_widget), ("top", self.top_camera_widget), ("right_cam", self.right_camera_widget)]:
                     if key in obs:
@@ -585,26 +562,8 @@ class RecordInteractiveStudio(BaseInteractiveStudio):
             self.cleanup_studio_sync()
             self.add_log("Studio cleanup completed.")
 
+
 def record_interactive(robot: Robot, leader: Teleoperator, params):
-    """
-    Interactive recording studio GUI.
-    
-    Args:
-        robot: The follower robot.
-        leader: The leader teleoperator robot.
-        params: An object (e.g. types.SimpleNamespace) holding configuration parameter attributes.
-        
-    Example:
-        from types import SimpleNamespace
-        
-        params = SimpleNamespace(
-            repo_id="lhwdev/pick_umbrella",
-            root_dir="/home/lhwdev/csi-agent/lerobot/lhwdev/records/pick_umbrella",
-            task="Pick up the umbrella.",
-            episodes=30,
-        )
-        record_interactive(robot, leader, params)
-    """
     if isinstance(params, dict):
         params = SimpleNamespace(**params)
     return RecordInteractiveStudio(robot, leader, params)
