@@ -73,6 +73,8 @@ class DAggerInteractiveStudio(DAggerUIMixin, BaseInteractiveStudio):
         super().__init__(robot, leader, params)
 
         self.optimizer_cache = None
+        self._last_checkpoint = "none"
+        self._last_train_info = None
 
     def get_dataset_features(self):
         features = super().get_dataset_features()
@@ -103,13 +105,13 @@ class DAggerInteractiveStudio(DAggerUIMixin, BaseInteractiveStudio):
             else:
                 output_dir = "./outputs/dagger_online"
                 
-        return {
-            "training_steps": getattr(self.params, "dagger_train_steps", 100),
-            "batch_size": getattr(self.params, "dagger_train_batch_size", 4),
-            "log_freq": 10,
-            "save_freq": 100,
-            "output_directory": output_dir,
-        }
+        return SimpleNamespace(
+            training_steps=getattr(self.params, "dagger_train_steps", 100),
+            batch_size=getattr(self.params, "dagger_train_batch_size", 4),
+            log_freq=100,
+            save_freq=1000,
+            output_directory=output_dir,
+        )
 
     def load_episode_rounds_cache(self):
         self.episode_rounds_cache = {}
@@ -202,6 +204,18 @@ class DAggerInteractiveStudio(DAggerUIMixin, BaseInteractiveStudio):
                     self.add_log(f"Loading original policy: {policy_path}")
                 else:
                     self.add_log("Warning: No policy path provided to load.")
+
+        # Resolve initial checkpoint name
+        self._last_checkpoint = "none"
+        if actual_policy_load_path is not None:
+            try:
+                resolved_path = Path(actual_policy_load_path).resolve()
+                if resolved_path.name.isdigit():
+                    self._last_checkpoint = resolved_path.name
+                elif (resolved_path / "checkpoints" / "last").exists():
+                    self._last_checkpoint = (resolved_path / "checkpoints" / "last").resolve().name
+            except Exception:
+                pass
                     
         # Load config and override self.params.policies
         if actual_policy_load_path is not None:
@@ -478,7 +492,17 @@ class DAggerInteractiveStudio(DAggerUIMixin, BaseInteractiveStudio):
         # Auto Tab Switching
         self.prev_tab_index = self.studio_tab.selected_index
         self.studio_tab.selected_index = self.training_tab_index
-        self.train_status_widget.value = "<div class='train-status' style='font-size: 11px; color: #495057; font-family: monospace; border-top: 1px solid #dee2e6; margin-top: 4px; padding-top: 4px;'>Status: Starting...</div>"
+
+        # Initialize training start time and render initial starting status layout
+        self._train_start_time = None
+        self._train_start_step = None
+        self._last_train_info = None
+        self.on_train_progress({
+            "step": 0,
+            "total_steps": getattr(self.params, "dagger_train_steps", 100),
+            "loss": 0.0,
+            "status": "starting",
+        })
 
         try:
             # Refresh dataset reader so it contains all newly saved episodes
@@ -503,7 +527,7 @@ class DAggerInteractiveStudio(DAggerUIMixin, BaseInteractiveStudio):
                 ds = self.datasets[0]
                 
                 # Prepare arguments for train_generic
-                train_params = SimpleNamespace(**self.get_online_training_params())
+                train_params = self.get_online_training_params()
                 train_params.dagger_rehearsal_beta = getattr(self.params, "dagger_rehearsal_beta", 0.3)
                 train_params.dagger_rehearsal_alpha = getattr(self.params, "dagger_rehearsal_alpha", 0.5)
 
@@ -558,7 +582,19 @@ class DAggerInteractiveStudio(DAggerUIMixin, BaseInteractiveStudio):
             if hasattr(self, "prev_tab_index") and self.prev_tab_index is not None:
                 self.studio_tab.selected_index = self.prev_tab_index
 
-            self.train_status_widget.value = "<div class='train-status' style='font-size: 11px; color: #495057; font-family: monospace; border-top: 1px solid #dee2e6; margin-top: 4px; padding-top: 4px;'>Status: Completed</div>"
+            # Render final completed state
+            if getattr(self, "_last_train_info", None) is not None:
+                final_info = dict(self._last_train_info)
+                final_info["status"] = "completed"
+                final_info["step"] = final_info["total_steps"]  # Ensure it displays at 100%
+                self.on_train_progress(final_info)
+            else:
+                self.on_train_progress({
+                    "step": getattr(self.params, "dagger_train_steps", 100),
+                    "total_steps": getattr(self.params, "dagger_train_steps", 100),
+                    "loss": 0.0,
+                    "status": "completed",
+                })
 
             self.start_btn.disabled = False
             self.train_btn.disabled = False

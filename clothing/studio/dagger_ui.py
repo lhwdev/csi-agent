@@ -1,6 +1,8 @@
+import time
 import ipywidgets as widgets
 from pathlib import Path
-
+import numpy as np
+from types import SimpleNamespace
 
 class DAggerUIMixin:
     """
@@ -79,7 +81,9 @@ class DAggerUIMixin:
             elif key == 'p' and not self.pause_btn.disabled: self.on_pause_clicked(None)
             elif key == 's' and not self.stop_btn.disabled: self.on_stop_clicked(None)
             elif key == 'd' and not self.discard_btn.disabled: self.on_discard_clicked(None)
-            elif key == 't' and not self.train_btn.disabled: self.on_train_clicked(None)
+            elif key == 't' and not self.train_btn.disabled:
+                self.prev_tab_index = self.studio_tab.selected_index
+                self.studio_tab.selected_index = self.training_tab_index
             elif key == 'q': self.cleanup_studio_sync()
 
         self.shortcut_input.observe(on_shortcut_change, names='value')
@@ -190,9 +194,6 @@ class DAggerUIMixin:
         if not hasattr(self, "train_info_widget") or self.train_info_widget is None:
             return
 
-        import numpy as np
-        from types import SimpleNamespace
-
         current_training_round = getattr(self, "current_training_round", 1)
         newest_round_frames = 0
         if not hasattr(self, "_newest_round_frames_cache"):
@@ -214,7 +215,7 @@ class DAggerUIMixin:
             except Exception:
                 pass
 
-        train_params = SimpleNamespace(**self.get_online_training_params())
+        train_params = self.get_online_training_params()
         beta = getattr(train_params, "dagger_rehearsal_beta", 0.3)
         new_epochs = self.epochs_slider.value
         batch_size = train_params.batch_size
@@ -246,17 +247,115 @@ class DAggerUIMixin:
     # ------------------------------------------------------------------
 
     def on_train_progress(self, info):
-        step = info["step"]
-        total = info["total_steps"]
-        loss = info["loss"]
+        self._last_train_info = info
+
+        step = info.get("step", 0)
+        total = info.get("total_steps", 100)
+        loss = info.get("loss", 0.0)
         val_loss = info.get("val_loss")
         status = info.get("status", "training")
 
-        percent = (step / total) * 100 if total > 0 else 0
-        val_loss_str = f", val: {val_loss:.5f}" if val_loss is not None else ""
-
-        status_text = f"Status: {status.capitalize()} ({percent:.1f}%)<br>Step {step}/{total}<br>Loss: {loss:.5f}{val_loss_str}"
         if "checkpoint_dir" in info:
-            status_text += f"<br><span style='color: #2b8a3e;'>Saved: {Path(info['checkpoint_dir']).name}</span>"
+            self._last_checkpoint = Path(info["checkpoint_dir"]).name
 
-        self.train_status_widget.value = f"<div class='train-status' style='font-size: 11px; color: #495057; font-family: monospace; border-top: 1px solid #dee2e6; margin-top: 4px; padding-top: 4px;'>{status_text}</div>"
+        # Calculate percentage
+        percent = (step / total) * 100 if total > 0 else 0
+
+        # Calculate time (timer starts only when status is "training")
+        start_time = getattr(self, "_train_start_time", None)
+        start_step = getattr(self, "_train_start_step", 0)
+
+        if status == "training" and start_time is None:
+            start_time = time.time()
+            start_step = step
+            self._train_start_time = start_time
+            self._train_start_step = start_step
+
+        if start_time is not None:
+            elapsed_sec = time.time() - start_time
+            steps_done = step - start_step
+            steps_left = total - step
+            if steps_done > 0 and step < total:
+                remaining_sec = steps_left * (elapsed_sec / steps_done)
+            else:
+                remaining_sec = 0 if step >= total else None
+        else:
+            elapsed_sec = 0.0
+            remaining_sec = None
+
+        def format_time(seconds):
+            if seconds is None:
+                return "--:--"
+            seconds = int(seconds)
+            if seconds < 0:
+                seconds = 0
+            mins, secs = divmod(seconds, 60)
+            hrs, mins = divmod(mins, 60)
+            if hrs > 0:
+                return f"{hrs}:{mins:02d}:{secs:02d}"
+            return f"{mins:02d}:{secs:02d}"
+
+        elapsed_str = format_time(elapsed_sec)
+        remaining_str = format_time(remaining_sec)
+
+        # Style chip component (stable size, no layout shift)
+        last_chk = getattr(self, "_last_checkpoint", "none")
+        if status == "saving":
+            chip_text = "Saving..."
+            chip_bg = "#e8f5e9"
+            chip_border = "#c8e6c9"
+            chip_color = "#2e7d32"
+            chip_weight = "600"
+        else:
+            chip_text = f"Saved to {last_chk}"
+            chip_bg = "#f1f3f5"
+            chip_border = "#dee2e6"
+            chip_color = "#495057"
+            chip_weight = "500"
+
+        chip_html = f"""<span style="
+            display: inline-flex; align-items: center; justify-content: center;
+            min-width: 120px; height: 18px;
+            border-radius: 12px;
+            font-size: 11px; font-weight: {chip_weight};
+            padding: 0 8px; box-sizing: border-box; vertical-align: middle;
+            margin-left: 6px;
+            border: 1px solid {chip_border};
+            background-color: {chip_bg}; color: {chip_color};
+        ">{chip_text}</span>"""
+
+        # Line 1: Status display
+        if status == "completed":
+            status_display = "Completed"
+            status_color = "#2b8a3e"
+        elif status == "starting":
+            status_display = "Starting"
+            status_color = "#495057"
+        else:
+            status_display = "Training"
+            status_color = "#228be6"
+
+        line1 = f'Status: <strong style="color: {status_color};">{status_display}</strong> {chip_html}'
+
+        # Line 2: Step & Loss & Time
+        val_loss_str = f"{val_loss:.5f}" if val_loss is not None else "—"
+        line2 = f"Step {step}/{total} / Loss T={loss:.5f}, V={val_loss_str} [{elapsed_str} &lt; {remaining_str}]"
+
+        # Line 3: Progress bar with color changing when done
+        pb_color = "#40c057" if status == "completed" else "#228be6"
+        line3 = f"""
+        <div style="display: flex; align-items: center; margin-top: 6px;">
+            <div style="flex-grow: 1; background-color: #e9ecef; border-radius: 4px; height: 8px; overflow: hidden; position: relative;">
+                <div style="width: {percent:.1f}%; background-color: {pb_color}; height: 100%; transition: width 0.1s ease-in-out;"></div>
+            </div>
+            <span style="font-size: 11px; font-weight: bold; color: #495057; margin-left: 8px; min-width: 45px; text-align: right;">{percent:.1f}%</span>
+        </div>
+        """
+
+        self.train_status_widget.value = f"""
+        <div class="train-status" style="font-size: 11px; color: #495057; font-family: monospace; border-top: 1px solid #dee2e6; margin-top: 4px; padding-top: 4px; line-height: 1.6;">
+            <div>{line1}</div>
+            <div>{line2}</div>
+            {line3}
+        </div>
+        """
