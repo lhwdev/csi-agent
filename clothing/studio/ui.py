@@ -103,13 +103,14 @@ class StudioUIMixin:
         self.next_step_btn = widgets.Button(description="Next Step (N)", icon="step-forward", button_style="info", disabled=True)
         self.stop_btn = widgets.Button(description="Save Episode", icon="save", button_style="primary", disabled=True)
         self.discard_btn = widgets.Button(description="Discard & Redo", icon="trash", button_style="danger", disabled=True)
+        self.snapshot_btn = widgets.Button(description="Snapshot (C)", icon="camera", button_style="info", disabled=True)
 
         self.prev_btn = widgets.Button(description="Prev Ep", icon="chevron-left", disabled=True)
         self.next_btn = widgets.Button(description="Next Ep", icon="chevron-right", disabled=True)
         self.quit_btn = widgets.Button(description="Exit Studio", icon="times-circle", button_style="danger")
 
         self.control_row_1 = widgets.HBox([self.start_btn, self.pause_btn, self.prev_step_btn, self.next_step_btn], layout=widgets.Layout(flex_flow='row wrap', width='100%', max_width='100%'))
-        self.control_row_2 = widgets.HBox([self.stop_btn, self.discard_btn], layout=widgets.Layout(flex_flow='row wrap', width='100%', max_width='100%'))
+        self.control_row_2 = widgets.HBox([self.stop_btn, self.discard_btn, self.snapshot_btn], layout=widgets.Layout(flex_flow='row wrap', width='100%', max_width='100%'))
         self.navigation_row = widgets.HBox([self.prev_btn, self.next_btn, self.quit_btn], layout=widgets.Layout(flex_flow='row wrap', width='100%', max_width='100%'))
         
         self.quit_btn.on_click(lambda b: self.cleanup_studio_sync())

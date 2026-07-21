@@ -24,11 +24,12 @@ class RecordInteractiveStudio(BaseInteractiveStudio):
         self.start_btn.disabled = False
         self.prev_step_btn.disabled = True
         self.next_step_btn.disabled = True
+        self.snapshot_btn.disabled = False
         self.update_navigation_buttons()
         self.recording_state = "IDLE"
         self.current_dataset_step_idx = 0
         self.update_status_card()
-        self.add_log("Studio ready. Position robot and click 'Start Episode' to record.")
+        self.add_log("Studio ready. Position robot and click 'Start Episode' or 'Snapshot' to record.")
 
     def update_navigation_buttons(self):
         if self.datasets and self.recording_state == "IDLE":
@@ -62,6 +63,7 @@ class RecordInteractiveStudio(BaseInteractiveStudio):
         self.pause_btn.on_click(self.on_pause_clicked)
         self.stop_btn.on_click(self.on_stop_clicked)
         self.discard_btn.on_click(self.on_discard_clicked)
+        self.snapshot_btn.on_click(self.on_snapshot_clicked)
         
     def build_shortcuts(self):
         super().build_shortcuts()
@@ -76,6 +78,7 @@ class RecordInteractiveStudio(BaseInteractiveStudio):
             <div><span style="background: #eee; padding: 2px 5px; border-radius: 3px; border: 1px solid #ccc; font-weight: bold;">P</span> Pause</div>
             <div><span style="background: #eee; padding: 2px 5px; border-radius: 3px; border: 1px solid #ccc; font-weight: bold;">S</span> Save Episode</div>
             <div><span style="background: #eee; padding: 2px 5px; border-radius: 3px; border: 1px solid #ccc; font-weight: bold;">D</span> Discard & Redo</div>
+            <div><span style="background: #eee; padding: 2px 5px; border-radius: 3px; border: 1px solid #ccc; font-weight: bold;">C</span> Snapshot</div>
             <div><span style="background: #eee; padding: 2px 5px; border-radius: 3px; border: 1px solid #ccc; font-weight: bold;">[</span> Prev Ep</div>
             <div><span style="background: #eee; padding: 2px 5px; border-radius: 3px; border: 1px solid #ccc; font-weight: bold;">]</span> Next Ep</div>
           </div>
@@ -128,6 +131,9 @@ class RecordInteractiveStudio(BaseInteractiveStudio):
             elif key == 'd':
                 if not self.discard_btn.disabled:
                     self.on_discard_clicked(None)
+            elif key == 'c':
+                if not self.snapshot_btn.disabled:
+                    self.on_snapshot_clicked(None)
             elif key == '[':
                 if not self.prev_btn.disabled:
                     self.on_prev_clicked(None)
@@ -283,6 +289,7 @@ class RecordInteractiveStudio(BaseInteractiveStudio):
         self.next_step_btn.disabled = (len(self.steps_val) <= 1)
         self.stop_btn.disabled = False
         self.discard_btn.disabled = False
+        self.snapshot_btn.disabled = True
         self.prev_btn.disabled = True
         self.next_btn.disabled = True
         
@@ -368,6 +375,7 @@ class RecordInteractiveStudio(BaseInteractiveStudio):
                 self.pause_btn.icon = "pause"
                 self.stop_btn.disabled = True
                 self.discard_btn.disabled = True
+                self.snapshot_btn.disabled = False
                 self.update_navigation_buttons()
                 self.add_log(f"Automatically moved to Episode {self.current_episode_idx}. Ready to record.")
         except Exception as e:
@@ -406,6 +414,7 @@ class RecordInteractiveStudio(BaseInteractiveStudio):
             self.recording_state = "IDLE"
             self.current_dataset_step_idx = 0
             self.update_status_card()
+            self.snapshot_btn.disabled = False
             self.update_navigation_buttons()
         except Exception as e:
             self.add_log(f"Error discarding episode: {str(e)}")
@@ -562,6 +571,64 @@ class RecordInteractiveStudio(BaseInteractiveStudio):
             self.cleanup_studio_sync()
             self.add_log("Studio cleanup completed.")
 
+
+    def on_snapshot_clicked(self, b):
+        self.active_bg_task = self.schedule_background_task(self.take_snapshot_async())
+
+    async def take_snapshot_async(self):
+        if self.recording_state != "IDLE":
+            self.add_log("Cannot take snapshot: studio is not IDLE.")
+            return
+            
+        self.recording_state = "SAVING"
+        self.start_btn.disabled = True
+        self.pause_btn.disabled = True
+        self.prev_step_btn.disabled = True
+        self.next_step_btn.disabled = True
+        self.stop_btn.disabled = True
+        self.discard_btn.disabled = True
+        self.snapshot_btn.disabled = True
+        self.update_status_card()
+        
+        self.add_log(f"Taking snapshot for episode {self.current_episode_idx}...")
+        try:
+            obs = self.robot.get_observation()
+            observation_frame = self.robot_observation_processor(obs)
+            
+            action_dict = {
+                k: obs[k].item() if hasattr(obs[k], "item") else float(obs[k])
+                for k in self.robot.action_features if k in obs
+            }
+            action_frame = self.teleop_action_processor((action_dict, obs))
+            
+            task_str = self.steps_val[self.current_dataset_step_idx]["task"]
+            frame_data = {
+                **observation_frame,
+                **action_frame,
+                "task": task_str
+            }
+            
+            # Save 15 frames (0.5s of static data) to all datasets to ensure a tiny valid episode
+            self.frames_in_episode = 0
+            for ds in self.datasets:
+                for _ in range(15):
+                    ds.add_frame(frame_data)
+                self.frames_in_episode = 15
+                
+            self.recording_state = "RECORDING"
+            self.episode_start_time = time.perf_counter()
+            self.accumulated_time = 0.0
+            
+            await self.save_current_episode_async()
+        except Exception as e:
+            self.add_log(f"Error taking snapshot: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            self.recording_state = "IDLE"
+            self.update_status_card()
+            self.start_btn.disabled = False
+            self.snapshot_btn.disabled = False
+            self.update_navigation_buttons()
 
 def record_interactive(robot: Robot, leader: Teleoperator, params):
     if isinstance(params, dict):

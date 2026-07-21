@@ -1,3 +1,5 @@
+import torch
+import cv2
 from lerobot.configs import PreTrainedConfig
 from lerobot.robots.config import RobotConfig
 from lerobot.robots.robot import Robot
@@ -23,6 +25,93 @@ logger = logging.getLogger(__name__)
 from typing import Optional
 
 _transition_direction: Optional[int] = None
+
+def classify_frame(obs, classifier, image_processor, device, rename_map):
+    top_key = None
+    for k in ["observation.images.top", "top", "camera1", "observation.images.camera1"]:
+        if k in obs:
+            top_key = k
+            break
+    if top_key is None and rename_map:
+        for k in obs.keys():
+            if "top" in k or "camera1" in k:
+                top_key = k
+                break
+    if top_key is None or obs[top_key] is None:
+        return None
+        
+    img = obs[top_key]
+    if isinstance(img, torch.Tensor):
+        img = img.cpu().numpy()
+        
+    if img.ndim == 3 and img.shape[0] in [1, 3]:
+        img = img.transpose(1, 2, 0)
+    
+    img_resized = cv2.resize(img, (224, 224))
+    
+    inputs = image_processor(images=img_resized, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    
+    with torch.no_grad():
+        outputs = classifier(**inputs)
+        logits = outputs.logits
+        probs = torch.softmax(logits, dim=-1)
+        pred_class = torch.argmax(probs, dim=-1).item()
+        confidence = probs[0, pred_class].item()
+        
+    return pred_class, confidence
+
+def interpolate_to_posture(robot, target_posture: dict[str, float], duration_s: float = 2.5, fps: float = 30.0):
+    import time
+    import math
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    current_obs = robot.get_observation()
+    start_joints = {k: current_obs[k] for k in target_posture.keys() if k in current_obs}
+    
+    for k in target_posture.keys():
+        if k not in start_joints:
+            logger.warning(f"Homing joint {k} not found in current observation.")
+            start_joints[k] = target_posture[k]
+            
+    steps = max(int(duration_s * fps), 1)
+    control_interval = 1.0 / fps
+    
+    for step in range(1, steps + 1):
+        loop_start = time.perf_counter()
+        t = step / steps
+        t_smoothed = (1.0 - math.cos(math.pi * t)) / 2.0
+        
+        cmd = {}
+        for k in target_posture.keys():
+            v_start = start_joints[k]
+            v_target = target_posture[k]
+            if hasattr(v_start, "item"): v_start = v_start.item()
+            if hasattr(v_target, "item"): v_target = v_target.item()
+            cmd[k] = v_start * (1 - t_smoothed) + v_target * t_smoothed
+            
+        robot.send_action(cmd)
+        
+        dt = time.perf_counter() - loop_start
+        if (sleep_t := control_interval - dt) > 0:
+            time.sleep(sleep_t)
+
+# Weighted transition delay configuration
+MIN_TRANSITION_CONFIDENCE = 0.6   # Minimum confidence required to trigger transition
+CONFIDENCE_HIGH = 1.0             # Reference high confidence
+DELAY_AT_CONF_HIGH = 1.0          # Delay (seconds) at high confidence
+CONFIDENCE_LOW = 0.6              # Reference low confidence
+DELAY_AT_CONF_LOW = 5.0           # Delay (seconds) at low confidence
+
+def get_required_delay(confidence: float) -> float:
+    if confidence >= CONFIDENCE_HIGH:
+        return DELAY_AT_CONF_HIGH
+    if confidence <= CONFIDENCE_LOW:
+        return DELAY_AT_CONF_LOW
+    # Linear interpolation between LOW and HIGH confidence delay points
+    ratio = (confidence - CONFIDENCE_LOW) / (CONFIDENCE_HIGH - CONFIDENCE_LOW)
+    return DELAY_AT_CONF_LOW - ratio * (DELAY_AT_CONF_LOW - DELAY_AT_CONF_HIGH)
 
 def pump_ipython_events():
     pass
@@ -147,11 +236,26 @@ def check_transition_vlm(obs: dict, current_step: int, task: str) -> Optional[in
 
 
 class MultiStepStrategy(BaseStrategy):
-    def __init__(self, config: BaseStrategyConfig, step_idx: int, task: str):
+    def __init__(
+        self,
+        config: BaseStrategyConfig,
+        step_idx: int,
+        task: str,
+        classifier=None,
+        image_processor=None,
+        device=None,
+        rename_map=None,
+        idle_posture=None,
+    ):
         super().__init__(config)
         self.step_idx = step_idx
         self.task = task
         self.next_step_idx: Optional[int] = None
+        self.classifier = classifier
+        self.image_processor = image_processor
+        self.classifier_device = device
+        self.rename_map = rename_map
+        self.idle_posture = idle_posture
 
     def run(self, ctx: RolloutContext) -> None:
         """Custom run loop that checks for VLM transitions."""
@@ -166,6 +270,15 @@ class MultiStepStrategy(BaseStrategy):
         engine.resume()
         logger.info(f"MultiStepStrategy control loop started for step {self.step_idx}")
 
+        timeout_limit = 60.0 if self.step_idx == 1 else 20.0
+        class_history = []
+        window_size = 15
+        regression_consecutive_count = 0
+        frame_count = 0
+        
+        transition_target_class = None
+        transition_accumulated_time = 0.0
+
         while not ctx.runtime.shutdown_event.is_set():
             loop_start = time.perf_counter()
 
@@ -175,13 +288,67 @@ class MultiStepStrategy(BaseStrategy):
 
             obs = robot.get_observation()
             
-            # --- VLM Transition Check ---
-            next_step = check_transition_vlm(obs, self.step_idx, self.task)
-            if next_step is not None:
-                logger.info(f"VLM signaled transition to step {next_step}")
-                self.next_step_idx = next_step
-                break
+            # --- ViT Classifier Transition & Fallback Check ---
+            if self.classifier is not None and self.image_processor is not None:
+                res = classify_frame(obs, self.classifier, self.image_processor, self.classifier_device, self.rename_map)
+                if res is not None:
+                    pred_class, confidence = res
+                    
+                    if frame_count % 30 == 0:
+                        logger.info(f"[Classifier] Pred: {pred_class} (conf: {confidence:.2f}), Current step: {self.step_idx}")
+                    frame_count += 1
+                    
+                    class_history.append(pred_class)
+                    if len(class_history) > window_size:
+                        class_history.pop(0)
+                        
+                    smoothed_class = max(set(class_history), key=class_history.count)
+                    
+                    # Transition condition: next state achieved with enough confidence
+                    if smoothed_class == self.step_idx + 1 and confidence >= MIN_TRANSITION_CONFIDENCE:
+                        if transition_target_class != smoothed_class:
+                            transition_target_class = smoothed_class
+                            transition_accumulated_time = 0.0
+                        
+                        transition_accumulated_time += control_interval
+                        required_delay = get_required_delay(confidence)
+                        
+                        if transition_accumulated_time >= required_delay:
+                            logger.info(f"Classifier transition detected to next state {smoothed_class} after stable delay {transition_accumulated_time:.2f}s")
+                            self.next_step_idx = smoothed_class
+                            break
+                    else:
+                        transition_target_class = None
+                        transition_accumulated_time = 0.0
+                        
+                    if self.step_idx >= 2 and smoothed_class in [0, 1]:
+                        regression_consecutive_count += 1
+                        if regression_consecutive_count >= 30:
+                            logger.warning(f"State regression detected! Pred: {smoothed_class}. Triggering recovery fallback to step0.")
+                            self.next_step_idx = 1
+                            break
+                    else:
+                        regression_consecutive_count = 0
+            else:
+                next_step = check_transition_vlm(obs, self.step_idx, self.task)
+                if next_step is not None:
+                    logger.info(f"UI signaled transition to step {next_step}")
+                    self.next_step_idx = next_step
+                    break
             # ----------------------------
+
+            # --- Timeout Check ---
+            elapsed = time.perf_counter() - start_time
+            if elapsed > timeout_limit:
+                logger.warning(f"Step {self.step_idx} timed out after {elapsed:.1f}s.")
+                if self.step_idx == 1:
+                    logger.error("Step0 unfolding timed out! Terminating rollout.")
+                    self.next_step_idx = -1
+                else:
+                    logger.warning("Triggering recovery fallback to step0.")
+                    self.next_step_idx = 1
+                break
+            # ---------------------
 
             obs_processed = self._process_observation_and_notify(ctx.processors, obs)
 
@@ -214,6 +381,15 @@ class MultiStepStrategy(BaseStrategy):
 
         import asyncio
 
+        timeout_limit = 60.0 if self.step_idx == 1 else 20.0
+        class_history = []
+        window_size = 15
+        regression_consecutive_count = 0
+        frame_count = 0
+        
+        transition_target_class = None
+        transition_accumulated_time = 0.0
+
         while not ctx.runtime.shutdown_event.is_set():
             loop_start = time.perf_counter()
 
@@ -223,13 +399,67 @@ class MultiStepStrategy(BaseStrategy):
 
             obs = robot.get_observation()
             
-            # --- VLM Transition Check ---
-            next_step = check_transition_vlm(obs, self.step_idx, self.task)
-            if next_step is not None:
-                logger.info(f"VLM signaled transition to step {next_step}")
-                self.next_step_idx = next_step
-                break
+            # --- ViT Classifier Transition & Fallback Check ---
+            if self.classifier is not None and self.image_processor is not None:
+                res = classify_frame(obs, self.classifier, self.image_processor, self.classifier_device, self.rename_map)
+                if res is not None:
+                    pred_class, confidence = res
+                    
+                    if frame_count % 30 == 0:
+                        logger.info(f"[Classifier] Pred: {pred_class} (conf: {confidence:.2f}), Current step: {self.step_idx}")
+                    frame_count += 1
+                    
+                    class_history.append(pred_class)
+                    if len(class_history) > window_size:
+                        class_history.pop(0)
+                        
+                    smoothed_class = max(set(class_history), key=class_history.count)
+                    
+                    # Transition condition: next state achieved with enough confidence
+                    if smoothed_class == self.step_idx + 1 and confidence >= MIN_TRANSITION_CONFIDENCE:
+                        if transition_target_class != smoothed_class:
+                            transition_target_class = smoothed_class
+                            transition_accumulated_time = 0.0
+                        
+                        transition_accumulated_time += control_interval
+                        required_delay = get_required_delay(confidence)
+                        
+                        if transition_accumulated_time >= required_delay:
+                            logger.info(f"Classifier transition detected to next state {smoothed_class} after stable delay {transition_accumulated_time:.2f}s")
+                            self.next_step_idx = smoothed_class
+                            break
+                    else:
+                        transition_target_class = None
+                        transition_accumulated_time = 0.0
+                        
+                    if self.step_idx >= 2 and smoothed_class in [0, 1]:
+                        regression_consecutive_count += 1
+                        if regression_consecutive_count >= 30:
+                            logger.warning(f"State regression detected! Pred: {smoothed_class}. Triggering recovery fallback to step0.")
+                            self.next_step_idx = 1
+                            break
+                    else:
+                        regression_consecutive_count = 0
+            else:
+                next_step = check_transition_vlm(obs, self.step_idx, self.task)
+                if next_step is not None:
+                    logger.info(f"UI signaled transition to step {next_step}")
+                    self.next_step_idx = next_step
+                    break
             # ----------------------------
+
+            # --- Timeout Check ---
+            elapsed = time.perf_counter() - start_time
+            if elapsed > timeout_limit:
+                logger.warning(f"Step {self.step_idx} timed out after {elapsed:.1f}s.")
+                if self.step_idx == 1:
+                    logger.error("Step0 unfolding timed out! Terminating rollout.")
+                    self.next_step_idx = -1
+                else:
+                    logger.warning("Triggering recovery fallback to step0.")
+                    self.next_step_idx = 1
+                break
+            # ---------------------
 
             obs_processed = self._process_observation_and_notify(ctx.processors, obs)
 
@@ -307,11 +537,45 @@ def rollout(
     asynchronous: bool = True,
     compile: bool = True,
     rename_map: Optional[dict[str, str]] = None,
+    classifier_path: Optional[str] = None,
 ):
     init_logging()
     register_third_party_plugins()
     
     signal_handler = ProcessSignalHandler(use_threads=True, display_pid=False)
+    
+    # Load state classifier if path is provided
+    classifier = None
+    image_processor = None
+    device = None
+    if classifier_path is not None:
+        logger.info(f"Loading state classifier from {classifier_path}...")
+        import torch
+        from transformers import AutoModelForImageClassification, AutoImageProcessor
+        device = "cuda" if torch.cuda.is_available() else ("xpu" if torch.xpu.is_available() else "cpu")
+        try:
+            classifier = AutoModelForImageClassification.from_pretrained(classifier_path).to(device)
+            classifier.eval()
+            image_processor = AutoImageProcessor.from_pretrained(classifier_path)
+            logger.info("Classifier loaded successfully.")
+        except Exception as e:
+            logger.error(f"Failed to load classifier: {e}")
+
+    # Load idle posture if it exists
+    import json
+    import os
+    idle_posture = None
+    for search_dir in [os.path.dirname(__file__), "."]:
+        idle_path = os.path.join(search_dir, "idle_posture.json")
+        if os.path.exists(idle_path):
+            try:
+                with open(idle_path, "r") as f:
+                    idle_data = json.load(f)
+                idle_posture = idle_data["joint_positions"]
+                logger.info(f"Loaded idle posture from {idle_path}")
+                break
+            except Exception as e:
+                logger.warning(f"Failed to load idle posture from {idle_path}: {e}")
     
     # Ensure robot is instantiated and connected once for all steps
     if isinstance(robot, RobotConfig):
@@ -384,7 +648,16 @@ def rollout(
                 rename_map=rename_map,
                 shutdown_event=signal_handler.shutdown_event
             )
-            strategy = MultiStepStrategy(ctx.runtime.cfg.strategy, step_idx, task)
+            strategy = MultiStepStrategy(
+                ctx.runtime.cfg.strategy,
+                step_idx,
+                task,
+                classifier=classifier,
+                image_processor=image_processor,
+                device=device,
+                rename_map=rename_map,
+                idle_posture=idle_posture,
+            )
             
             try:
                 strategy.setup(ctx)
@@ -400,9 +673,21 @@ def rollout(
                 break
                 
             if strategy.next_step_idx is not None:
-                if strategy.next_step_idx == -1:
+                next_step = strategy.next_step_idx
+                if next_step == -1:
                     break
-                step_idx = strategy.next_step_idx
+                
+                # Check for fallback recovery
+                if next_step < step_idx and idle_posture is not None:
+                    print(f"=== Fallback Detected (from step {step_idx} to step {next_step}) ===")
+                    print("Executing safe homing reset routine...")
+                    try:
+                        interpolate_to_posture(robot, idle_posture, duration_s=2.5, fps=30.0)
+                        print("Safe homing reset complete.")
+                    except Exception as e:
+                        print(f"Error during safe homing reset: {e}")
+                
+                step_idx = next_step
             else:
                 # If the strategy exited for another reason (e.g. duration limit),
                 # just proceed to the next step linearly.
