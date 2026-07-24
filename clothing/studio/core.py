@@ -72,7 +72,7 @@ class BaseInteractiveStudio(StudioUIMixin):
 
         if not self.robot.is_connected:
             self.robot.connect()
-        if not self.leader.is_connected:
+        if self.leader is not None and not getattr(self.leader, "is_connected", False):
             self.leader.connect()
 
         try:

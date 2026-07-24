@@ -30,8 +30,6 @@ class StudioUIMixin:
         """)
 
         self.status_card = widgets.HTML()
-        self.update_status_card()
-
         self.telemetry_widget = widgets.HTML()
         
         self.log_widget = widgets.HTML()
@@ -43,6 +41,8 @@ class StudioUIMixin:
         self.build_controls()
         self.build_shortcuts()
         self.build_cameras()
+
+        self.update_status_card()
 
         left_column = widgets.VBox([
             self.cameras_layout,
@@ -183,7 +183,7 @@ class StudioUIMixin:
         if leader_act is not None:
             self.latest_action = leader_act
 
-        if not self.plotter_is_updating:
+        if hasattr(self, "plotter") and self.plotter is not None and not self.plotter_is_updating:
             self.plotter_is_updating = True
             def run_plot():
                 state_data = getattr(self, "latest_state", {})
@@ -207,3 +207,7 @@ class StudioUIMixin:
                 loop.create_task(run_plot_async())
             except RuntimeError:
                 self.plotter_is_updating = False
+
+    def cleanup_studio_sync(self):
+        self.keep_running = False
+        self.add_log("Studio cleanup completed.")

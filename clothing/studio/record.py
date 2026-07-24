@@ -593,26 +593,40 @@ class RecordInteractiveStudio(BaseInteractiveStudio):
         self.add_log(f"Taking snapshot for episode {self.current_episode_idx}...")
         try:
             obs = self.robot.get_observation()
-            observation_frame = self.robot_observation_processor(obs)
+            obs_processed = self.robot_observation_processor(obs)
             
             action_dict = {
                 k: obs[k].item() if hasattr(obs[k], "item") else float(obs[k])
                 for k in self.robot.action_features if k in obs
             }
-            action_frame = self.teleop_action_processor((action_dict, obs))
-            
-            task_str = self.steps_val[self.current_dataset_step_idx]["task"]
-            frame_data = {
-                **observation_frame,
-                **action_frame,
-                "task": task_str
-            }
+            teleop_action = self.teleop_action_processor((action_dict, obs))
             
             # Save 15 frames (0.5s of static data) to all datasets to ensure a tiny valid episode
             self.frames_in_episode = 0
-            for ds in self.datasets:
+            for idx, ds in enumerate(self.datasets):
+                ds_obs_processed = dict(obs_processed)
+                for key, feat in ds.features.items():
+                    if key.startswith(f"{OBS_STR}.images."):
+                        cam_key = key.replace(f"{OBS_STR}.images.", "")
+                        if cam_key in ds_obs_processed:
+                            img = ds_obs_processed[cam_key]
+                            expected_shape = feat["shape"]
+                            target_h, target_w = (expected_shape[0], expected_shape[1]) if expected_shape[-1] == 3 else (expected_shape[1], expected_shape[2])
+                            if img.shape[:2] != (target_h, target_w):
+                                ds_obs_processed[cam_key] = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+                observation_frame = build_dataset_frame(ds.features, ds_obs_processed, prefix=OBS_STR)
+                action_frame = build_dataset_frame(ds.features, teleop_action, prefix=ACTION)
+                
+                task_str = self.steps_val[idx]["task"]
+                frame_data = {
+                    **observation_frame,
+                    **action_frame,
+                    "task": task_str
+                }
+                
                 for _ in range(15):
-                    ds.add_frame(frame_data)
+                    ds.add_frame(dict(frame_data))
                 self.frames_in_episode = 15
                 
             self.recording_state = "RECORDING"
